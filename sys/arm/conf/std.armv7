@@ -63,8 +63,8 @@ options 	KDB			# Enable kernel debugger support.
 options 	KDB_TRACE		# Print a stack trace for a panic.
 
 # Optional extras, never enabled by default:
-#options 	BOOTVERBOSE
-#options 	DEBUG			# May result in extreme spewage
+options 	BOOTVERBOSE
+options 	DEBUG			# May result in extreme spewage
 #options 	KTR
 #options 	KTR_COMPILE=KTR_ALL
 #options 	KTR_ENTRIES=16384
