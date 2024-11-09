@@ -209,7 +209,9 @@
 
 #define TEGRA_PCIB_MSI_ENABLE
 
+#ifndef DEBUG
 #define	DEBUG
+#endif
 #ifdef DEBUG
 #define	debugf(fmt, args...) do { printf(fmt,##args); } while (0)
 #else
