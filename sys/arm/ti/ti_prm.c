@@ -38,8 +38,11 @@
 
 #include <dev/ofw/ofw_bus_subr.h>
 
+#include <dev/extres/syscon/syscon.h>
 #include <arm/ti/ti_prcm.h>
 #include <arm/ti/ti_prm.h>
+
+#include "syscon_if.h"
 
 #if 0
 #define DPRINTF(dev, msg...) device_printf(dev, msg)
@@ -54,6 +57,7 @@ struct ti_prm_softc {
 	device_t		dev;
 	uint8_t			type;
 	bool			has_reset;
+	struct syscon		*syscon;
 };
 
 /* Device */
@@ -94,6 +98,10 @@ ti_prm_probe(device_t dev)
 		return (ENXIO);
 
 	device_set_desc(dev, "TI OMAP Power Management");
+
+	if (bootverbose == 0)
+		device_quiet(dev);
+
 	return(BUS_PROBE_DEFAULT);
 }
 
@@ -102,6 +110,7 @@ ti_prm_attach(device_t dev)
 {
 	struct ti_prm_softc *sc;
 	phandle_t node;
+	int err;
 
  	sc = device_get_softc(dev);
 	sc->dev = dev;
@@ -109,9 +118,13 @@ ti_prm_attach(device_t dev)
 
 	node = ofw_bus_get_node(sc->dev);
 
-	if (OF_hasprop(node, "#reset-cells")) {
+	err = SYSCON_GET_HANDLE(dev, &sc->syscon);
+	if (err != 0)
+		panic("Cannot get syscon handle.\n");
+
+	if (OF_hasprop(node, "#reset-cells") == 1)
 		sc->has_reset = true;
-	} else
+	else
 		sc->has_reset = false;
 
 	/* Make device visible for other drivers */
@@ -135,50 +148,9 @@ ti_prm_reset(device_t dev)
 	if (sc->has_reset == false)
 		return 1;
 
-	err = ti_prm_modify_4(dev, TI_PRM_PER_RSTCTRL, 0x2, 0x00);
+	err = SYSCON_MODIFY_4(sc->syscon, TI_PRM_PER_RSTCTRL, 0x2, 0x00);
+
 	return (err);
-}
-
-int
-ti_prm_write_4(device_t dev, bus_addr_t addr, uint32_t val)
-{
-	device_t parent;
-
-	parent = device_get_parent(dev);
-	DPRINTF(dev, "offset=%lx write %x\n", addr, val);
-	ti_prcm_device_lock(parent);
-	ti_prcm_write_4(parent, addr, val);
-	ti_prcm_device_unlock(parent);
-	return (0);
-}
-
-int
-ti_prm_read_4(device_t dev, bus_addr_t addr, uint32_t *val)
-{
-	device_t parent;
-
-	parent = device_get_parent(dev);
-
-	ti_prcm_device_lock(parent);
-	ti_prcm_read_4(parent, addr, val);
-	ti_prcm_device_unlock(parent);
-	DPRINTF(dev, "offset=%lx Read %x\n", addr, *val);
-	return (0);
-}
-
-int
-ti_prm_modify_4(device_t dev, bus_addr_t addr, uint32_t clr, uint32_t set)
-{
-	device_t parent;
-
-	parent = device_get_parent(dev);
-
-	ti_prcm_device_lock(parent);
-	ti_prcm_modify_4(parent, addr, clr, set);
-	ti_prcm_device_unlock(parent);
-	DPRINTF(dev, "offset=%lx (clr %x set %x)\n", addr, clr, set);
-
-	return (0);
 }
 
 static device_method_t ti_prm_methods[] = {
