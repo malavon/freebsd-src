@@ -116,6 +116,12 @@ struct ti_pruss_irqsc
 	struct ts_ring_buf	tstamps;
 };
 
+static struct ofw_compat_data compat_data[] = {
+	{ "ti,pruss-v1",	1 },
+	{ "ti,pruss-v2",	1 },
+	{ NULL,			0 },
+};
+
 static struct cdevsw ti_pruss_cdevirq = {
 	.d_version =	D_VERSION,
 	.d_name =	"ti_pruss_irq",
@@ -327,8 +333,9 @@ ti_pruss_interrupts_enable(struct ti_pruss_softc *sc, int8_t irq, bool enable)
 	}
 
 	if (enable) {
-		sc->sc_irq_devs[irq].sc_pdev = make_dev(&ti_pruss_cdevirq, 0, UID_ROOT, GID_WHEEL,
-		    0600, "pruss%d.irq%d", device_get_unit(sc->sc_pdev->si_drv1), irq);
+		sc->sc_irq_devs[irq].sc_pdev = make_dev(&ti_pruss_cdevirq, 0,
+		    UID_ROOT, GID_WHEEL, 0600,
+		    "pruss%d.irq%d", device_get_unit(sc->sc_pdev->si_drv1), irq);
 		sc->sc_irq_devs[irq].sc_pdev->si_drv1 = &sc->sc_irq_devs[irq];
 
 		sc->sc_irq_devs[irq].tstamps.ctl.idx = 0;
@@ -492,6 +499,7 @@ ti_pruss_global_interrupt_enable(SYSCTL_HANDLER_ARGS)
 
 	return (err);
 }
+
 static int
 ti_pruss_probe(device_t dev)
 {
@@ -499,13 +507,15 @@ ti_pruss_probe(device_t dev)
 	if (!ofw_bus_status_okay(dev))
 		return (ENXIO);
 
-	if (ofw_bus_is_compatible(dev, "ti,pruss-v1") ||
-	    ofw_bus_is_compatible(dev, "ti,pruss-v2")) {
-		device_set_desc(dev, "TI Programmable Realtime Unit Subsystem");
-		return (BUS_PROBE_DEFAULT);
-	}
+	if (ofw_bus_search_compatible(dev, compat_data)->ocd_data == 0)
+		return (ENXIO);
 
-	return (ENXIO);
+	device_set_desc(dev, "TI Programmable Realtime Unit Subsystem");
+
+	if (bootverbose == 0)
+		device_quiet(dev);
+
+	return (BUS_PROBE_DEFAULT);
 }
 
 static int
@@ -556,9 +566,9 @@ ti_pruss_attach(device_t dev)
 		return (ENXIO);
 	}
 
-	err = clk_get_by_name(dev, "pruss_ocp_gclk@530", &pruss_ocp_gclk);
+	err = clk_get_by_name(dev, "pruss_ocp_gclk", &pruss_ocp_gclk);
 	if (err) {
-		device_printf(dev, "Cant get pruss_ocp_gclk@530 err %d\n", err);
+		device_printf(dev, "Cant get pruss_ocp_gclk err %d\n", err);
 		return (ENXIO);
 	}
 

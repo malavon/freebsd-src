@@ -941,6 +941,10 @@ am335x_lcd_probe(device_t dev)
 
 	device_set_desc(dev, "AM335x LCD controller");
 
+	if (bootverbose == 0)
+		device_quiet(dev);
+
+
 #ifdef DEV_SC
 	err = sc_probe_unit(device_get_unit(dev), 
 	    device_get_flags(dev) | SC_AUTODETECT_KBD);
@@ -974,10 +978,10 @@ am335x_lcd_attach(device_t dev)
 		return (ENXIO);
 	}
 
-	/* Fixme: Cant find any reference in DTS for dpll_disp_ck@498 for now. */
-	err = clk_get_by_name(dev, "dpll_disp_ck@498", &sc->sc_clk_dpll_disp_ck);
+	/* Fixme: Cant find any reference in DTS for dpll_disp_ck for now. */
+	err = clk_get_by_name(dev, "dpll_disp_ck", &sc->sc_clk_dpll_disp_ck);
 	if (err != 0) {
-		device_printf(dev, "Cant get dpll_disp_ck@49\n");
+		device_printf(dev, "Cant get dpll_disp_ck\n");
 		return (ENXIO);
 	}
 
@@ -991,7 +995,8 @@ am335x_lcd_attach(device_t dev)
 
 	panel_node = fdt_find_compatible(root, "ti,tilcdc,panel", 1);
 	if (panel_node != 0) {
-		device_printf(dev, "using static panel info\n");
+		if (bootverbose)
+			device_printf(dev, "using static panel info\n");
 		if (am335x_read_panel_info(dev, panel_node, &sc->sc_panel)) {
 			device_printf(dev, "failed to read panel info\n");
 			return (ENXIO);
