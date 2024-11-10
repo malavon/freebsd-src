@@ -47,9 +47,12 @@
 #include <dev/ofw/ofw_bus_subr.h>
 
 #include <dev/extres/clk/clk.h>
-
-#include <arm/ti/ti_sysc.h>
-#include <arm/ti/clk/clock_common.h>
+#include <dev/extres/clk/clk_link.h>
+ 
+ #include <arm/ti/ti_sysc.h>
+#include <arm/ti/clk/am33xx.h>
+#include <arm/ti/clk/ti_clock_common.h>
+#include <arm/ti/ti_cpuid.h>
 
 #define DEBUG_SYSC	0
 
@@ -131,7 +134,6 @@ struct clk_list {
 
 struct ti_sysc_softc {
 	struct simplebus_softc	sc;
-	bool			attach_done;
 
 	device_t		dev;
 	int			device_type;
@@ -241,7 +243,7 @@ ti_sysc_clock_enable(device_t dev) {
 	TAILQ_FOREACH_SAFE(clkp, &sc->clk_list, next, clkp_tmp) {
 		err = clk_enable(clkp->clk);
 
-		if (err) {
+		if (err != 0) {
 			DPRINTF(sc->dev, "clk_enable %s failed %d\n",
 				clk_get_name(clkp->clk), err);
 			break;
@@ -259,7 +261,7 @@ ti_sysc_clock_disable(device_t dev) {
 	TAILQ_FOREACH_SAFE(clkp, &sc->clk_list, next, clkp_tmp) {
 		err = clk_disable(clkp->clk);
 
-		if (err) {
+		if (err != 0) {
 			DPRINTF(sc->dev, "clk_enable %s failed %d\n",
 				clk_get_name(clkp->clk), err);
 			break;
@@ -278,7 +280,18 @@ parse_regfields(struct ti_sysc_softc *sc) {
 	int err, k, reg_i, prop_idx;
 	uint32_t idx;
 
+	/* Make sure address & size are 0 */
+	for (idx = 0; idx < REG_MAX; idx++) {
+		sc->reg[idx].address = 0;
+		sc->reg[idx].size = 0;
+	}
+
 	node = ofw_bus_get_node(sc->dev);
+
+	/* Ensure its a reg node at all */
+	if (!ofw_bus_has_prop(sc->dev, "reg"))
+		/* Silently ignore for now */
+		return (0);
 
 	/* Get parents address and size properties */
 	err = OF_searchencprop(OF_parent(node), "#address-cells",
@@ -307,12 +320,6 @@ parse_regfields(struct ti_sysc_softc *sc) {
 
 	reg = malloc(nreg, M_DEVBUF, M_WAITOK);
 	OF_getencprop(node, "reg", reg, nreg);
-
-	/* Make sure address & size are 0 */
-	for (idx = 0; idx < REG_MAX; idx++) {
-		sc->reg[idx].address = 0;
-		sc->reg[idx].size = 0;
-	}
 
 	/* Loop through reg-names and figure out which reg-name corresponds to
 	 * index populate the values into the reg array.
@@ -345,6 +352,7 @@ parse_regfields(struct ti_sysc_softc *sc) {
 			sc->reg[prop_idx].size);
 	}
 	free(reg, M_DEVBUF);
+
 	return (0);
 }
 
@@ -356,9 +364,8 @@ parse_idle(struct ti_sysc_softc *sc, const char *name, uint32_t *idle) {
 
 	node = ofw_bus_get_node(sc->dev);
 
-	if (!OF_hasprop(node, name)) {
+	if (OF_hasprop(node, name) == 0)
 		return;
-	}
 
 	len = OF_getproplen(node, name);
 	no = len / sizeof(cell_t);
@@ -395,36 +402,6 @@ parse_idle(struct ti_sysc_softc *sc, const char *name, uint32_t *idle) {
 }
 
 static int
-ti_sysc_attach_clocks(struct ti_sysc_softc *sc) {
-	clk_t *clk;
-	struct clk_list *clkp;
-	int index, err;
-
-	clk = malloc(sc->num_clocks*sizeof(clk_t), M_DEVBUF, M_WAITOK | M_ZERO);
-
-	/* Check if all clocks can be found */
-	for (index = 0; index < sc->num_clocks; index++) {
-		err = clk_get_by_ofw_index(sc->dev, 0, index, &clk[index]);
-
-		if (err != 0) {
-			free(clk, M_DEVBUF);
-			return (1);
-		}
-	}
-
-	/* All clocks are found, add to list */
-	for (index = 0; index < sc->num_clocks; index++) {
-		clkp = malloc(sizeof(*clkp), M_DEVBUF, M_WAITOK | M_ZERO);
-		clkp->clk = clk[index];
-		TAILQ_INSERT_TAIL(&sc->clk_list, clkp, next);
-	}
-
-	/* Release the clk array */
-	free(clk, M_DEVBUF);
-	return (0);
-}
-
-static int
 ti_sysc_simplebus_attach_child(device_t dev) {
 	device_t cdev;
 	phandle_t node, child;
@@ -433,6 +410,9 @@ ti_sysc_simplebus_attach_child(device_t dev) {
 	node = ofw_bus_get_node(sc->dev);
 
 	for (child = OF_child(node); child > 0; child = OF_peer(child)) {
+		if (!ofw_bus_node_status_okay(child))
+			continue;
+
 		cdev = simplebus_add_device(sc->dev, child, 0, NULL, -1, NULL);
 		if (cdev != NULL)
 			device_probe_and_attach(cdev);
@@ -451,8 +431,71 @@ ti_sysc_probe(device_t dev)
 		return (ENXIO);
 
 	device_set_desc(dev, "TI SYSC Interconnect");
+	if (bootverbose == 0)
+		device_quiet(dev);
 
 	return (BUS_PROBE_DEFAULT);
+}
+
+static void
+ti_sysc_init_clk_links(device_t dev) {
+	int chip_id;
+	int i, err;
+	struct clkdom *clkdom;
+	device_t child;
+	device_t root_dev = dev;
+	device_t tmp_dev;
+
+	/* find device root to attach the imaginary ti_clkinit.
+	 * Its used to create clk_link for future clocks.
+	 */
+	while (1) {
+		tmp_dev = device_get_parent(root_dev);
+		if (tmp_dev == NULL)
+			break;
+		root_dev = tmp_dev;
+	}
+
+	/* If ti_clkinitX already exist the links are already created */
+	if (device_find_child(root_dev, "ti_clkinit", -1) != NULL) {
+		return;
+	}
+
+	/* otherwise add ti_clkinit as a child to the root */
+	child = device_add_child(root_dev, "ti_clkinit", -1);
+	if (child == NULL)
+		panic("Cant add ti_clkinit\n");
+
+	clkdom = clkdom_create(dev);
+	if (clkdom == NULL)
+		panic("Cannot create clkdom\n");
+
+	chip_id = ti_chip();
+	if (chip_id == CHIP_AM335X) {
+		/*
+		 * pre-create clocks to get handles to parents
+		 * before they actually exists
+		 */
+		for (i = 0; i < nitems(scm_clocks); i++) {
+			err = clknode_link_register(clkdom,
+			    &scm_clocks[i]);
+			if (err != 0)
+				device_printf(dev, "Cant create clock link %s\n",
+				    scm_clocks[i].clkdef.name);
+		}
+		for (i = 0; i < nitems(per_cm_0); i++) {
+			err = clknode_link_register(clkdom,
+			    &per_cm_0[i]);
+			if (err != 0)
+				device_printf(dev, "Cant create clock link %s\n",
+				    per_cm_0[i].clkdef.name);
+		}
+	}
+	else if (chip_id == CHIP_OMAP_4)
+		device_printf(dev, "Todo - add clock support");
+
+	if (clkdom_finit(clkdom) != 0)
+		panic("cannot finalize clkdom initialization\n");
 }
 
 static int
@@ -468,6 +511,9 @@ ti_sysc_attach(device_t dev)
 	sc->device_type = ofw_bus_search_compatible(dev, compat_data)->ocd_data;
 
 	node = ofw_bus_get_node(sc->dev);
+
+	ti_sysc_init_clk_links(dev);
+
 	/* ranges - use simplebus */
 	simplebus_init(sc->dev, node);
 	if (simplebus_fill_ranges(node, &sc->sc) < 0) {
@@ -482,21 +528,21 @@ ti_sysc_attach(device_t dev)
 
 	/* Required field reg & reg-names - assume at least "rev" exists */
 	err = parse_regfields(sc);
-	if (err) {
+	if (err != 0) {
 		DPRINTF(sc->dev, "parse_regfields failed %d\n", err);
 		return (ENXIO);
 	}
 
 	/* Optional */
-	if (OF_hasprop(node, "ti,sysc-mask")) {
+	if (OF_hasprop(node, "ti,sysc-mask") == 1) {
 		OF_getencprop(node, "ti,sysc-mask", &value, sizeof(cell_t));
 		sc->ti_sysc_mask = value;
 	}
-	if (OF_hasprop(node, "ti,syss-mask")) {
+	if (OF_hasprop(node, "ti,syss-mask") == 1) {
 		OF_getencprop(node, "ti,syss-mask", &value, sizeof(cell_t));
 		sc->ti_syss_mask = value;
 	}
-	if (OF_hasprop(node, "ti,sysc-delay-us")) {
+	if (OF_hasprop(node, "ti,sysc-delay-us") == 1) {
 		OF_getencprop(node, "ti,sysc-delay-us", &value, sizeof(cell_t));
 		sc->ti_sysc_delay_us = value;
 	}
@@ -507,17 +553,17 @@ ti_sysc_attach(device_t dev)
 	parse_idle(sc, "ti,sysc-midle", sc->ti_sysc_midle);
 	parse_idle(sc, "ti,sysc-sidle", sc->ti_sysc_sidle);
 
-	if (OF_hasprop(node, "ti,no-reset-on-init"))
+	if (OF_hasprop(node, "ti,no-reset-on-init") == 1)
 		sc->ti_no_reset_on_init = true;
 	else
 		sc->ti_no_reset_on_init = false;
 
-	if (OF_hasprop(node, "ti,no-idle-on-init"))
+	if (OF_hasprop(node, "ti,no-idle-on-init") == 1)
 		sc->ti_no_idle_on_init = true;
 	else
 		sc->ti_no_idle_on_init = false;
 
-	if (OF_hasprop(node, "ti,no-idle"))
+	if (OF_hasprop(node, "ti,no-idle") == 1)
 		sc->ti_no_idle = true;
 	else
 		sc->ti_no_idle = false;
@@ -528,30 +574,69 @@ ti_sysc_attach(device_t dev)
 		sc->ti_no_idle_on_init,
 		sc->ti_no_idle);
 
-	if (OF_hasprop(node, "clocks")) {
-		struct clock_cell_info cell_info;
-		read_clock_cells(sc->dev, &cell_info);
-		free(cell_info.clock_cells, M_DEVBUF);
-		free(cell_info.clock_cells_ncells, M_DEVBUF);
+	if (OF_hasprop(node, "clocks") == 1) {
+		int idx, clk_idx;
+		const char *name = ofw_bus_get_name(dev);
+		clk_t clkk;
 
-		sc->num_clocks = cell_info.num_real_clocks;
-		TAILQ_INIT(&sc->clk_list);
+		DPRINTF(dev, "ti_sysc_attach bus name %s\n",
+			name);
+		err = clk_get_by_ofw_index(dev, node, 0, &clkk);
+		if (err == 0) {
+			/* TODO: support multiple clocks.... */
+			struct clk_list *clkp;
+			clkp = malloc(sizeof(*clkp), M_DEVBUF,
+			    M_WAITOK | M_ZERO);
+			err = clk_get_by_ofw_index(dev, node, 0, &clkp->clk);
 
-		err = ti_sysc_attach_clocks(sc);
-		if (err) {
-			DPRINTF(sc->dev, "Failed to attach clocks\n");
-			return (bus_generic_attach(sc->dev));
-		}
+			DPRINTF(dev, "err %d clk_get_name: %s\n",
+				err, clk_get_name(clkk));
+			TAILQ_INIT(&sc->clk_list);
+			sc->num_clocks =  1; //sysc_clock_table[idx].parent_cnt;
+			TAILQ_INSERT_TAIL(&sc->clk_list, clkp, next);
+		} else {
+			DPRINTF(dev, "USE LOOKUP TABLE\n");
+			for (idx = 0; idx < nitems(sysc_clock_table); idx++) {
+				if (strcmp(sysc_clock_table[idx].node_name, name)==0)
+					break;
+			}
+
+			if (idx == nitems(sysc_clock_table))
+				panic("Cant find clocks for node %s\n", name);
+
+			DPRINTF(dev, "%s at sysc_clock_table[%d]\n", name, idx);
+			/*
+			 * Found the correct place in the lookup table.
+			 * Loop through and get the clocks
+			 */
+
+			TAILQ_INIT(&sc->clk_list);
+			sc->num_clocks = sysc_clock_table[idx].parent_cnt;
+			clk_idx = 0;
+			for (; clk_idx < sysc_clock_table[idx].parent_cnt; clk_idx++) {
+				struct clk_list *clkp;
+				clkp = malloc(sizeof(*clkp), M_DEVBUF,
+				    M_WAITOK | M_ZERO);
+
+				err = clk_get_by_name(dev,
+				    sysc_clock_table[idx].parent_names[clk_idx],
+				    &clkp->clk);
+				if (err != 0)
+					panic("Cant get clock %s err %d",
+					  sysc_clock_table[idx].parent_names[clk_idx],
+					  err);
+
+				TAILQ_INSERT_TAIL(&sc->clk_list, clkp, next);
+			} /* for */
+		} /* else */
 	}
 
 	err = ti_sysc_simplebus_attach_child(sc->dev);
-	if (err) {
+	if (err != 0) {
 		DPRINTF(sc->dev, "ti_sysc_simplebus_attach_child %d\n",
 		    err);
 		return (err);
 	}
-
-	sc->attach_done = true;
 
 	return (bus_generic_attach(sc->dev));
 }
@@ -562,49 +647,11 @@ ti_sysc_detach(device_t dev)
 	return (EBUSY);
 }
 
-/* Bus interface */
-static void
-ti_sysc_new_pass(device_t dev)
-{
-	struct ti_sysc_softc *sc;
-	int err;
-	phandle_t node;
-
-	sc = device_get_softc(dev);
-
-	if (sc->attach_done) {
-		bus_generic_new_pass(sc->dev);
-		return;
-	}
-
-	node = ofw_bus_get_node(sc->dev);
-	if (OF_hasprop(node, "clocks")) {
-		err = ti_sysc_attach_clocks(sc);
-		if (err) {
-			DPRINTF(sc->dev, "Failed to attach clocks\n");
-			return;
-		}
-	}
-
-	err = ti_sysc_simplebus_attach_child(sc->dev);
-	if (err) {
-		DPRINTF(sc->dev,
-		    "ti_sysc_simplebus_attach_child failed %d\n", err);
-		return;
-	}
-	sc->attach_done = true;
-
-	bus_generic_attach(sc->dev);
-}
-
 static device_method_t ti_sysc_methods[] = {
 	/* Device interface */
 	DEVMETHOD(device_probe,		ti_sysc_probe),
 	DEVMETHOD(device_attach,	ti_sysc_attach),
 	DEVMETHOD(device_detach,	ti_sysc_detach),
-
-	/* Bus interface */
-	DEVMETHOD(bus_new_pass,		ti_sysc_new_pass),
 
 	DEVMETHOD_END
 };
@@ -613,4 +660,4 @@ DEFINE_CLASS_1(ti_sysc, ti_sysc_driver, ti_sysc_methods,
 	sizeof(struct ti_sysc_softc), simplebus_driver);
 
 EARLY_DRIVER_MODULE(ti_sysc, simplebus, ti_sysc_driver, 0, 0,
-    BUS_PASS_BUS + BUS_PASS_ORDER_FIRST);
+    BUS_PASS_BUS + BUS_PASS_ORDER_MIDDLE);

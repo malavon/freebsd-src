@@ -42,24 +42,26 @@
 #include <vm/vm_kern.h>
 #include <vm/pmap.h>
 
+#include <dev/extres/clk/clk_gate.h>
+#include <dev/extres/clk/clk_div.h>
+#include <dev/extres/clk/clk_mux.h>
 #include <dev/fdt/simplebus.h>
 
 #include <dev/ofw/ofw_bus.h>
 #include <dev/ofw/ofw_bus_subr.h>
 
+#include <arm/ti/clk/am33xx.h>
+#include <arm/ti/clk/ti_clock_common.h>
 #include <arm/ti/clk/ti_clk_clkctrl.h>
 #include <arm/ti/ti_omap4_cm.h>
 #include <arm/ti/ti_cpuid.h>
+#include <dt-bindings/clock/am3.h>
 
 #if 0
 #define DPRINTF(dev, msg...) device_printf(dev, msg)
 #else
 #define DPRINTF(dev, msg...)
 #endif
-
-#define L4LS_CLKCTRL_38 	2
-#define L4_WKUP_CLKCTRL_0	1
-#define NO_SPECIAL_REG		0
 
 /* Documentation/devicetree/bindings/clock/ti-clkctrl.txt */
 
@@ -90,9 +92,9 @@ static int ti_clkctrl_attach(device_t dev);
 static int ti_clkctrl_detach(device_t dev);
 int clkctrl_ofw_map(struct clkdom *clkdom, uint32_t ncells,
     phandle_t *cells, struct clknode **clk);
+
 static int
-create_clkctrl(struct ti_clkctrl_softc *sc, cell_t *reg, uint32_t index, uint32_t reg_offset,
-    uint64_t parent_offset, const char *org_name, bool special_gdbclk_reg);
+create_clkctrl(struct ti_clkctrl_softc *sc, struct ti_clkctrl_lookup_table *table, int nitems, uint32_t reg_offset);
 
 static int
 ti_clkctrl_probe(device_t dev)
@@ -104,6 +106,9 @@ ti_clkctrl_probe(device_t dev)
 		return (ENXIO);
 
 	device_set_desc(dev, "TI clkctrl");
+	if (bootverbose == 0)
+		device_quiet(dev);
+
 
 	return (BUS_PROBE_DEFAULT);
 }
@@ -115,11 +120,9 @@ ti_clkctrl_attach(device_t dev)
 	phandle_t node;
 	cell_t	*reg;
 	ssize_t numbytes_reg;
-	int num_reg, err, ti_clock_cells;
-	uint32_t index, reg_offset, reg_address;
+	int err, ti_clock_cells;
 	const char *org_name;
 	uint64_t parent_offset;
-	uint8_t special_reg = NO_SPECIAL_REG;
 
 	sc = device_get_softc(dev);
 	sc->dev = dev;
@@ -129,12 +132,12 @@ ti_clkctrl_attach(device_t dev)
 	err = OF_searchencprop(node, "#clock-cells",
 		&ti_clock_cells, sizeof(ti_clock_cells));
 	if (err == -1) {
-		device_printf(sc->dev, "Failed to get #clock-cells\n");
+		DPRINTF(sc->dev, "Failed to get #clock-cells\n");
 		return (ENXIO);
 	}
 
 	if (ti_clock_cells != 2) {
-		device_printf(sc->dev, "clock cells(%d) != 2\n",
+		DPRINTF(sc->dev, "clock cells(%d) != 2\n",
 			ti_clock_cells);
 		return (ENXIO);
 	}
@@ -142,10 +145,9 @@ ti_clkctrl_attach(device_t dev)
 	/* Grab the content of reg properties */
 	numbytes_reg = OF_getproplen(node, "reg");
 	if (numbytes_reg == 0) {
-		device_printf(sc->dev, "reg property empty - check your devicetree\n");
+		DPRINTF(sc->dev, "reg property empty - check your devicetree\n");
 		return (ENXIO);
 	}
-	num_reg = numbytes_reg / sizeof(cell_t);
 
 	reg = malloc(numbytes_reg, M_DEVBUF, M_WAITOK);
 	OF_getencprop(node, "reg", reg, numbytes_reg);
@@ -166,69 +168,82 @@ ti_clkctrl_attach(device_t dev)
 	/* Get parent range */
 	parent_offset = ti_omap4_cm_get_simplebus_base_host(device_get_parent(dev));
 
-	/* Check if this is a clkctrl with special registers like gpio */
+	/* Find which clkctrl to populate */
 	switch (ti_chip()) {
 #ifdef SOC_OMAP4
 	case CHIP_OMAP_4:
 		/* FIXME: Todo */
 		break;
-
 #endif /* SOC_OMAP4 */
+
 #ifdef SOC_TI_AM335X
 	/* Checkout TRM 8.1.12.1.29 - 8.1.12.31 and 8.1.12.2.3
 	 * and the DTS.
 	 */
 	case CHIP_AM335X:
-		if (strcmp(org_name, "l4ls-clkctrl@38") == 0)
-			special_reg = L4LS_CLKCTRL_38;
-		else if (strcmp(org_name, "l4-wkup-clkctrl@0") == 0)
-			special_reg = L4_WKUP_CLKCTRL_0;
-		break;
+	if (strcmp(org_name, "l4ls_clkctrl") == 0)
+		err = create_clkctrl(sc, am33xx_l4ls_clkctrl_table,
+		    nitems(am33xx_l4ls_clkctrl_table), parent_offset + AM3_L4LS_CLKCTRL_OFFSET);
+	else if (strcmp(org_name, "l3s_clkctrl") == 0)
+		err = create_clkctrl(sc, am33xx_l3s_clkctrl_table,
+		    nitems(am33xx_l3s_clkctrl_table), parent_offset + AM3_L3S_CLKCTRL_OFFSET);
+	else if (strcmp(org_name, "l3_clkctrl") == 0)
+		err = create_clkctrl(sc, am33xx_l3_clkctrl_table,
+		    nitems(am33xx_l3_clkctrl_table), parent_offset + AM3_L3_CLKCTRL_OFFSET);
+	else if (strcmp(org_name, "l4hs_clkctrl") == 0)
+		err = create_clkctrl(sc, am33xx_l4hs_clkctrl_table,
+		    nitems(am33xx_l4hs_clkctrl_table), parent_offset + AM3_L4HS_CLKCTRL_OFFSET);
+	else if (strcmp(org_name, "pruss_ocp_clkctrl") == 0)
+		err = create_clkctrl(sc, am33xx_pruss_clkctrl_table,
+		    nitems(am33xx_pruss_clkctrl_table), parent_offset + AM3_PRUSS_OCP_CLKCTRL_OFFSET);
+	else if (strcmp(org_name, "cpsw_125mhz_clkctrl") == 0)
+		err = create_clkctrl(sc, am33xx_cpsw_clkctrl_table,
+		    nitems(am33xx_cpsw_clkctrl_table), parent_offset + 0);
+	else if (strcmp(org_name, "lcdc_clkctrl") == 0)
+		err = create_clkctrl(sc, am33xx_lcdc_clkctrl_table,
+		    nitems(am33xx_lcdc_clkctrl_table), parent_offset + AM3_LCDC_CLKCTRL_OFFSET);
+	else if (strcmp(org_name, "clk_24mhz_clkctrl") == 0)
+		err = create_clkctrl(sc, am33xx_clk_24mhz_clkctrl_table,
+		    nitems(am33xx_clk_24mhz_clkctrl_table), parent_offset + AM3_CLK_24MHZ_CLKCTRL_OFFSET);
+	else if (strcmp(org_name, "l4_wkup_clkctrl") == 0)
+		err = create_clkctrl(sc, am33xx_l4_wkup_clkctrl_table,
+		    nitems(am33xx_l4_wkup_clkctrl_table), parent_offset + 0);
+	else if (strcmp(org_name, "l3_aon_clkctrl") == 0)
+		err = create_clkctrl(sc, am33xx_l3_aon_clkctrl_table,
+		    nitems(am33xx_l3_aon_clkctrl_table), parent_offset + AM3_L3_AON_CLKCTRL_OFFSET);
+	else if (strcmp(org_name, "l4_wkup_aon_clkctrl") == 0)
+		err = create_clkctrl(sc, am33xx_l4_wkup_aon_clkctrl_table,
+		    nitems(am33xx_l4_wkup_aon_clkctrl_table), parent_offset + AM3_L4_WKUP_AON_CLKCTRL_OFFSET);
+	else if (strcmp(org_name, "mpu_clkctrl") == 0)
+		err = create_clkctrl(sc, am33xx_mpu_clkctrl_table,
+		    nitems(am33xx_mpu_clkctrl_table), parent_offset + 0);
+	else if (strcmp(org_name, "l4_rtc_clkctrl") == 0)
+		err = create_clkctrl(sc, am33xx_l4_rtc_clkctrl_table,
+		    nitems(am33xx_l4_rtc_clkctrl_table), parent_offset + 0);
+	else if (strcmp(org_name, "gfx_l3_clkctrl") == 0)
+		err = create_clkctrl(sc, am33xx_gfx_l3_clkctrl_table,
+		    nitems(am33xx_gfx_l3_clkctrl_table), parent_offset + 0);
+	else if (strcmp(org_name, "l4_cefuse_clkctrl") == 0)
+		err = create_clkctrl(sc, am33xx_l4_cefuse_clkctrl_table,
+		    nitems(am33xx_l4_cefuse_clkctrl_table), parent_offset + 0);
+	else
+		panic("Not expected clkctrl %s", org_name);
+	break;
 #endif /* SOC_TI_AM335X */
 	default:
 		break;
 	}
 
-	/* reg property has a pair of (base address, length) */
-	for (index = 0; index < num_reg; index += 2) {
-		for (reg_offset = 0; reg_offset < reg[index+1]; reg_offset += sizeof(cell_t)) {
-			err = create_clkctrl(sc, reg, index, reg_offset, parent_offset,
-			    org_name, false);
-			if (err)
-				goto cleanup;
+	if (err != 0) {
+		DPRINTF(sc->dev, "%s failed to create clock\n",
+			org_name);
+		err = ENXIO;
+		goto cleanup;
+	}
 
-			/* Create special clkctrl for GDBCLK in GPIO registers */
-			switch (special_reg) {
-			case NO_SPECIAL_REG:
-				break;
-			case L4LS_CLKCTRL_38:
-				reg_address = reg[index] + reg_offset-reg[0];
-				if (reg_address == 0x74 ||
-				    reg_address == 0x78 ||
-				    reg_address == 0x7C)
-				{
-					err = create_clkctrl(sc, reg, index, reg_offset,
-					    parent_offset, org_name, true);
-					if (err)
-						goto cleanup;
-				}
-				break;
-			case L4_WKUP_CLKCTRL_0:
-				reg_address = reg[index] + reg_offset - reg[0];
-				if (reg_address == 0x8)
-				{
-					err = create_clkctrl(sc, reg, index, reg_offset,
-					    parent_offset, org_name, true);
-					if (err)
-						goto cleanup;
-				}
-				break;
-			} /* switch (special_reg) */
-		} /* inner for */
-	} /* for */
 
 	err = clkdom_finit(sc->clkdom);
-	if (err) {
+	if (err != 0) {
 		DPRINTF(sc->dev, "Clk domain finit fails %x.\n", err);
 		err = ENXIO;
 		goto cleanup;
@@ -239,7 +254,7 @@ cleanup:
 
 	free(reg, M_DEVBUF);
 
-	if (err)
+	if (err != 0)
 		return (err);
 
 	return (bus_generic_attach(dev));
@@ -278,53 +293,98 @@ clkctrl_ofw_map(struct clkdom *clkdom, uint32_t ncells,
 }
 
 static int
-create_clkctrl(struct ti_clkctrl_softc *sc, cell_t *reg, uint32_t index, uint32_t reg_offset,
-    uint64_t parent_offset, const char *org_name, bool special_gdbclk_reg) {
-	struct ti_clk_clkctrl_def def;
-	char *name;
-	size_t name_len;
+create_clkctrl(struct ti_clkctrl_softc *sc, struct ti_clkctrl_lookup_table *table, int nitems, uint32_t reg_offset) {
+	struct ti_clk_clkctrl_def 	clkctrl;
+	struct clk_gate_def		gate;
+	struct clk_mux_def		mux;
+	struct clk_div_def		divider;
 	int err;
 
-	name_len = strlen(org_name) + 1 + 5; /* 5 = _xxxx */
-	name = malloc(name_len, M_OFWPROP, M_WAITOK);
+	for (int index = 0; index < nitems; index++) {
+	switch (table[index].clk_type) {
+	case TI_CLKCTRL_NO_SUB_CLOCK:
+		DPRINTF(sc->dev, "NO_SUB_CLOCK: %s\n", table[index].node_name);
+		/* set flags and name */
+		clkctrl.clkdef.flags = CLK_NODE_STATIC_STRINGS;
+		clkctrl.clkdef.name = table[index].node_name;
+		clkctrl.clkdef.id = table[index].offset + table[index].id_subclock;
 
-	/*
-	 * Check out XX_CLKCTRL-INDEX(offset)-macro dance in
-	 * sys/gnu/dts/dts/include/dt-bindings/clock/am3.h
-	 * sys/gnu/dts/dts/include/dt-bindings/clock/am4.h
-	 * sys/gnu/dts/dts/include/dt-bindings/clock/dra7.h
-	 * reg[0] are in practice the same as the offset described in the dts.
-	 */
-	/* special_gdbclk_reg are 0 or 1 */
-	def.clkdef.id = reg[index] + reg_offset - reg[0] + special_gdbclk_reg;
-	def.register_offset = parent_offset + reg[index] + reg_offset;
+		/* Handle parents */
+		clkctrl.clkdef.parent_cnt = table[index].parent_cnt;
+		clkctrl.clkdef.parent_names = table[index].parents;
 
-	/* Indicate this clkctrl is special and dont use IDLEST/MODULEMODE */
-	def.gdbclk = special_gdbclk_reg;
+		clkctrl.register_offset = table[index].offset + reg_offset;
+		clkctrl.flags = table[index].flags;
 
-	/* Make up an uniq name in the namespace for each clkctrl */
-	snprintf(name, name_len, "%s_%x",
-		org_name, def.clkdef.id);
-	def.clkdef.name = (const char *) name;
+		/* Register the clkctrl */
+		err = ti_clknode_clkctrl_register(sc->clkdom, &clkctrl);
+		break;
+	case TI_CLKCTRL_GATE:
+		DPRINTF(sc->dev, "GATE %s\n", table[index].node_name);
+		/* set flags and name */
+		gate.clkdef.flags = CLK_NODE_STATIC_STRINGS;
+		gate.clkdef.name = table[index].node_name;
+		gate.clkdef.id = table[index].offset + table[index].id_subclock;
+		gate.clkdef.parent_names = table[index].parents;
+		gate.clkdef.parent_cnt = table[index].parent_cnt;
 
-	DPRINTF(sc->dev, "ti_clkctrl_attach: reg[%d]: %s %x\n",
-		index, def.clkdef.name, def.clkdef.id);
+		gate.offset = table[index].offset + reg_offset;
+		gate.shift = table[index].shift;
+		gate.mask = table[index].mask;
+		gate.on_value = 1;
+		gate.off_value = 0;
+		gate.gate_flags = 0;
 
-	/* No parent name */
-	def.clkdef.parent_cnt = 0;
+		err = clknode_gate_register(sc->clkdom, &gate);
+		break;
+	case TI_CLKCTRL_MUX:
+		DPRINTF(sc->dev, "MUX %s\n", table[index].node_name);
+		/* set flags and name */
+		mux.clkdef.flags = CLK_NODE_STATIC_STRINGS;
+		mux.clkdef.name = table[index].node_name;
+		mux.clkdef.id = table[index].offset + table[index].id_subclock;
+		mux.clkdef.parent_names = table[index].parents;
+		mux.clkdef.parent_cnt = table[index].parent_cnt;
 
-	/* set flags */
-	def.clkdef.flags = 0x0;
+		mux.offset = table[index].offset + reg_offset;
+		mux.shift = table[index].shift;
+		mux.width = fls(table[index].mask >> table[index].shift);
 
-	/* Register the clkctrl */
-	err = ti_clknode_clkctrl_register(sc->clkdom, &def);
-	if (err) {
+		err = clknode_mux_register(sc->clkdom, &mux);
+		break;
+	case TI_CLKCTRL_DIVIDER:
+		DPRINTF(sc->dev, "DIVIDER %s\n", table[index].node_name);
+		/* set flags and name */
+		divider.clkdef.flags = CLK_NODE_STATIC_STRINGS;
+		divider.clkdef.name = table[index].node_name;
+		divider.clkdef.id = table[index].offset + table[index].id_subclock;
+		divider.clkdef.parent_names = table[index].parents;
+		divider.clkdef.parent_cnt = table[index].parent_cnt;
+
+		divider.offset = table[index].offset + reg_offset;
+		divider.i_shift = table[index].shift;
+		divider.i_width = fls(table[index].mask >> table[index].shift);
+		divider.f_shift = 0;
+		divider.f_width = 0;
+		divider.div_flags = 0;
+		divider.div_table = NULL;
+
+		err = clknode_div_register(sc->clkdom, &divider);
+		break;
+	default:
+		panic("clk_type %x not implemented\n",
+			table[index].clk_type);
+		break;
+	}
+
+	if (err != 0) {
 		DPRINTF(sc->dev,
 			"ti_clknode_clkctrl_register[%d:%d] failed %x\n",
 			index, reg_offset, err);
 		err = ENXIO;
+		break;
 	}
-	OF_prop_free(name);
+	} /* for */
 	return (err);
 }
 

@@ -38,10 +38,16 @@
 #include <dev/fdt/simplebus.h>
 
 #include <dev/extres/clk/clk_div.h>
+#include <dev/extres/syscon/syscon.h>
+
 #include <dev/ofw/ofw_bus.h>
 #include <dev/ofw/ofw_bus_subr.h>
 
-#include "clock_common.h"
+#include <arm/ti/clk/am33xx.h>
+#include <arm/ti/clk/ti_clock_common.h>
+#include <arm/ti/clk/ti_clksel.h>
+#include "clkdev_if.h"
+#include "syscon_if.h"
 
 #if 0
 #define DPRINTF(dev, msg...) device_printf(dev, msg)
@@ -49,18 +55,12 @@
 #define DPRINTF(dev, msg...)
 #endif
 
-/*
- * Devicetree description
- * Documentation/devicetree/bindings/clock/ti/divider.txt
- */
-
 struct ti_divider_softc {
-	device_t		sc_dev;
-	bool			attach_done;
+	device_t		dev;
 	struct clk_div_def	div_def;
 
-	struct clock_cell_info	clock_cell;
 	struct clkdom		*clkdom;
+	struct syscon		*syscon;
 };
 
 static int ti_divider_probe(device_t dev);
@@ -78,28 +78,62 @@ static struct ofw_compat_data compat_data[] = {
 };
 
 static int
-register_clk(struct ti_divider_softc *sc) {
-	int err;
+ti_divider_clkdev_write_4(device_t dev, bus_addr_t addr, uint32_t val)
+{
+	struct ti_divider_softc *sc;
 
-	sc->clkdom = clkdom_create(sc->sc_dev);
-	if (sc->clkdom == NULL) {
-		DPRINTF(sc->sc_dev, "Failed to create clkdom\n");
-		return (ENXIO);
-	}
+	sc = device_get_softc(dev);
+	DPRINTF(sc->dev, "ti_divider_clkdev_write_4: addr %x val %x\n",
+	    addr, val);
+	return (SYSCON_UNLOCKED_WRITE_4(sc->syscon, addr, val));
+}
 
-	err = clknode_div_register(sc->clkdom, &sc->div_def);
-	if (err) {
-		DPRINTF(sc->sc_dev, "clknode_div_register failed %x\n", err);
-		return (ENXIO);
-	}
+static int
+ti_divider_clkdev_read_4(device_t dev, bus_addr_t addr, uint32_t *val)
+{
+	struct ti_divider_softc *sc;
+	uint32_t rdval;
 
-	err = clkdom_finit(sc->clkdom);
-	if (err) {
-		DPRINTF(sc->sc_dev, "Clk domain finit fails %x.\n", err);
-		return (ENXIO);
-	}
+	sc = device_get_softc(dev);
 
+	rdval = SYSCON_UNLOCKED_READ_4(sc->syscon, addr);
+	*val = rdval;
+	DPRINTF(sc->dev, "ti_divider_clkdev_read_4: addr %x val %x\n",
+	     addr, *val);
 	return (0);
+}
+
+static int
+ti_divider_clkdev_modify_4(device_t dev, bus_addr_t addr,
+    uint32_t clear_mask, uint32_t set_mask)
+{
+	struct ti_divider_softc *sc;
+
+	sc = device_get_softc(dev);
+	DPRINTF(sc->dev, "ti_divider_clkdev_modify_4: addr %x clear %x set %x\n",
+	    addr, clear_mask, set_mask);
+	return (SYSCON_UNLOCKED_MODIFY_4(sc->syscon, addr, clear_mask,
+	    set_mask));
+}
+
+static void
+ti_divider_clkdev_device_lock(device_t dev)
+{
+	struct ti_divider_softc *sc;
+
+	sc = device_get_softc(dev);
+	DPRINTF(sc->dev, "ti_divider_clkdev_device_lock\n");
+	SYSCON_DEVICE_LOCK(sc->syscon->pdev);
+}
+
+static void
+ti_divider_clkdev_device_unlock(device_t dev)
+{
+	struct ti_divider_softc *sc;
+
+	sc = device_get_softc(dev);
+	DPRINTF(sc->dev, "ti_divider_clkdev_device_unlock\n");
+	SYSCON_DEVICE_UNLOCK(sc->syscon->pdev);
 }
 
 static int
@@ -112,6 +146,8 @@ ti_divider_probe(device_t dev)
 		return (ENXIO);
 
 	device_set_desc(dev, "TI Divider Clock");
+	if (bootverbose == 0)
+		device_quiet(dev);
 
 	return (BUS_PROBE_DEFAULT);
 }
@@ -121,17 +157,33 @@ ti_divider_attach(device_t dev)
 {
 	struct ti_divider_softc *sc;
 	phandle_t	node;
-	int		err;
+	int		err, index;
 	cell_t		value;
 	uint32_t	ti_max_div;
+	const char	*node_name;
 
 	sc = device_get_softc(dev);
-	sc->sc_dev = dev;
+	sc->dev = dev;
 	node = ofw_bus_get_node(dev);
 
-	/* Grab the content of reg properties */
-	OF_getencprop(node, "reg", &value, sizeof(value));
-	sc->div_def.offset = value;
+	err = SYSCON_GET_HANDLE(dev, &sc->syscon);
+	if (err != 0) {
+		panic("Cannot get syscon handle.\n");
+	}
+
+	clk_parse_ofw_clk_name(dev, node, &node_name);
+	if (node_name == NULL) {
+		panic("Cannot get name of the clock node");
+	}
+
+	/* Get the content of reg properties */
+	if (OF_hasprop(node, "reg") == 1) {
+		OF_getencprop(node, "reg", &value, sizeof(value));
+		sc->div_def.offset = value;
+	} else {
+		/* assume parent is clksel... */
+		sc->div_def.offset = ti_clksel_get_reg(device_get_parent(dev));
+	}
 
 	if (OF_hasprop(node, "ti,bit-shift")) {
 		OF_getencprop(node, "ti,bit-shift", &value, sizeof(value));
@@ -144,7 +196,8 @@ ti_divider_attach(device_t dev)
 
 	if (OF_hasprop(node, "ti,index-power-of-two")) {
 		/* FIXME: later */
-		device_printf(sc->sc_dev, "ti,index-power-of-two - Not implemented\n");
+		DPRINTF(sc->dev,
+		    "ti,index-power-of-two - Not implemented\n");
 		/* remember to update i_width a few lines below */
 	}
 	if (OF_hasprop(node, "ti,max-div")) {
@@ -153,18 +206,21 @@ ti_divider_attach(device_t dev)
 	}
 
 	if (OF_hasprop(node, "clock-output-names"))
-		device_printf(sc->sc_dev, "clock-output-names\n");
+		DPRINTF(sc->dev, "clock-output-names\n");
 	if (OF_hasprop(node, "ti,dividers"))
-		device_printf(sc->sc_dev, "ti,dividers\n");
+		DPRINTF(sc->dev, "ti,dividers\n");
 	if (OF_hasprop(node, "ti,min-div"))
-		device_printf(sc->sc_dev, "ti,min-div - Not implemented\n");
+		DPRINTF(sc->dev, "ti,min-div - Not implemented\n");
 
 	if (OF_hasprop(node, "ti,autoidle-shift"))
-		device_printf(sc->sc_dev, "ti,autoidle-shift - Not implemented\n");
+		DPRINTF(sc->dev,
+		   "ti,autoidle-shift - Not implemented\n");
 	if (OF_hasprop(node, "ti,set-rate-parent"))
-		device_printf(sc->sc_dev, "ti,set-rate-parent - Not implemented\n");
+		DPRINTF(sc->dev,
+		    "ti,set-rate-parent - Not implemented\n");
 	if (OF_hasprop(node, "ti,latch-bit"))
-		device_printf(sc->sc_dev, "ti,latch-bit - Not implemented\n");
+		DPRINTF(sc->dev,
+		    "ti,latch-bit - Not implemented\n");
 
 	/* Figure out the width from ti_max_div */
 	if (sc->div_def.div_flags)
@@ -172,33 +228,46 @@ ti_divider_attach(device_t dev)
 	else
 		sc->div_def.i_width = fls(ti_max_div);
 
-	DPRINTF(sc->sc_dev, "div_def.i_width %x\n", sc->div_def.i_width);
+	DPRINTF(sc->dev, "div_def.i_width %x\n", sc->div_def.i_width);
 
-	read_clock_cells(sc->sc_dev, &sc->clock_cell);
-
-	create_clkdef(sc->sc_dev, &sc->clock_cell, &sc->div_def.clkdef);
-
-	err = find_parent_clock_names(sc->sc_dev, &sc->clock_cell, &sc->div_def.clkdef);
-
-	if (err) {
-		/* free_clkdef will be called in ti_divider_new_pass */
-		DPRINTF(sc->sc_dev, "find_parent_clock_names failed\n");
-		return (bus_generic_attach(sc->sc_dev));
+	/* Find parent in lookup table */
+	for (index = 0; index < nitems(div_parent_table); index++) {
+		if (strcmp(node_name, div_parent_table[index].node_name) == 0)
+			break;
 	}
 
-	err = register_clk(sc);
+	if (index == nitems(div_parent_table))
+		panic("Cant find clock %s\n", node_name);
 
-	if (err) {
-		/* free_clkdef will be called in ti_divider_new_pass */
-		DPRINTF(sc->sc_dev, "register_clk failed\n");
-		return (bus_generic_attach(sc->sc_dev));
+	DPRINTF(sc->dev, "%s at div_parent_table[%d]\n", node_name, index);
+
+	/* Fill clknode_init_def */
+	sc->div_def.clkdef.id = 1;
+	sc->div_def.clkdef.flags = CLK_NODE_STATIC_STRINGS;
+	sc->div_def.clkdef.name = div_parent_table[index].node_name;
+	sc->div_def.clkdef.parent_cnt = div_parent_table[index].parent_cnt;
+	sc->div_def.clkdef.parent_names =
+		div_parent_table[index].parent_names;
+
+	sc->clkdom = clkdom_create(sc->dev);
+	if (sc->clkdom == NULL) {
+		DPRINTF(sc->dev, "Failed to create clkdom\n");
+		return (ENXIO);
 	}
 
-	sc->attach_done = true;
+	err = clknode_div_register(sc->clkdom, &sc->div_def);
+	if (err != 0) {
+		DPRINTF(sc->dev, "clknode_div_register failed %x\n", err);
+		return (ENXIO);
+	}
 
-	free_clkdef(&sc->div_def.clkdef);
+	err = clkdom_finit(sc->clkdom);
+	if (err != 0) {
+		DPRINTF(sc->dev, "Clk domain finit fails %x.\n", err);
+		return (ENXIO);
+	}
 
-	return (bus_generic_attach(sc->sc_dev));
+	return (bus_generic_attach(sc->dev));
 }
 
 static int
@@ -207,45 +276,18 @@ ti_divider_detach(device_t dev)
 	return (EBUSY);
 }
 
-static void
-ti_divider_new_pass(device_t dev)
-{
-	struct ti_divider_softc *sc;
-	int err;
-
-	sc = device_get_softc(dev);
-
-	if (sc->attach_done) {
-		return;
-	}
-
-	err = find_parent_clock_names(sc->sc_dev, &sc->clock_cell, &sc->div_def.clkdef);
-	if (err) {
-		/* free_clkdef will be called in a later call to ti_divider_new_pass */
-		DPRINTF(sc->sc_dev, "new_pass find_parent_clock_names failed\n");
-		return;
-	}
-
-	err = register_clk(sc);
-	if (err) {
-		/* free_clkdef will be called in a later call to ti_divider_new_pass */
-		DPRINTF(sc->sc_dev, "new_pass register_clk failed\n");
-		return;
-	}
-
-	sc->attach_done = true;
-
-	free_clkdef(&sc->div_def.clkdef);
-}
-
 static device_method_t ti_divider_methods[] = {
 	/* Device interface */
 	DEVMETHOD(device_probe,		ti_divider_probe),
 	DEVMETHOD(device_attach,	ti_divider_attach),
 	DEVMETHOD(device_detach,	ti_divider_detach),
 
-	/* Bus interface */
-	DEVMETHOD(bus_new_pass,		ti_divider_new_pass),
+	/* Clock device interface */
+	DEVMETHOD(clkdev_device_lock,	ti_divider_clkdev_device_lock),
+	DEVMETHOD(clkdev_device_unlock,	ti_divider_clkdev_device_unlock),
+	DEVMETHOD(clkdev_read_4,	ti_divider_clkdev_read_4),
+	DEVMETHOD(clkdev_write_4,	ti_divider_clkdev_write_4),
+	DEVMETHOD(clkdev_modify_4,	ti_divider_clkdev_modify_4),
 
 	DEVMETHOD_END
 };

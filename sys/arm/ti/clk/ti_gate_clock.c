@@ -37,11 +37,16 @@
 #include <machine/bus.h>
 #include <dev/fdt/simplebus.h>
 
-#include <dev/extres/clk/clk_gate.h>
 #include <dev/ofw/ofw_bus.h>
 #include <dev/ofw/ofw_bus_subr.h>
+#include <dev/extres/clk/clk_gate.h>
+#include <dev/extres/syscon/syscon.h>
 
-#include "clock_common.h"
+#include <arm/ti/clk/am33xx.h>
+#include <arm/ti/clk/ti_clock_common.h>
+#include <arm/ti/clk/ti_clksel.h>
+#include "clkdev_if.h"
+#include "syscon_if.h"
 
 #define DEBUG_GATE	0
 
@@ -51,19 +56,13 @@
 #define DPRINTF(dev, msg...)
 #endif
 
-/*
- * Devicetree description
- * Documentation/devicetree/bindings/clock/ti/gate.txt
- */
-
 struct ti_gate_softc {
-	device_t		sc_dev;
-	bool			attach_done;
+	device_t		dev;
 	uint8_t			sc_type;
 
 	struct clk_gate_def	gate_def;
-	struct clock_cell_info  clock_cell;
 	struct clkdom		*clkdom;
+	struct syscon		*syscon;
 };
 
 static int ti_gate_probe(device_t dev);
@@ -84,11 +83,69 @@ static struct ofw_compat_data compat_data[] = {
 	{ "ti,wait-gate-clock",			TI_WAIT_GATE_CLOCK },
 	{ "ti,dss-gate-clock",			TI_DSS_GATE_CLOCK },
 	{ "ti,am35xx-gate-clock",		TI_AM35XX_GATE_CLOCK },
-	{ "ti,clkdm-gate-clock",		TI_CLKDM_GATE_CLOCK },
+	/* For now, dont support clkdm-gate-clock */
+	/* { "ti,clkdm-gate-clock",		TI_CLKDM_GATE_CLOCK }, */
 	{ "ti,hsdiv-gate-cloc",			TI_HSDIV_GATE_CLOCK },
-	{ "ti,composite-no-wait-gate-clock",	TI_COMPOSITE_NO_WAIT_GATE_CLOCK },
+	{ "ti,composite-no-wait-gate-clock", TI_COMPOSITE_NO_WAIT_GATE_CLOCK },
 	{ NULL,					TI_GATE_END }
 };
+
+static int
+ti_gate_clkdev_write_4(device_t dev, bus_addr_t addr, uint32_t val)
+{
+	struct ti_gate_softc *sc;
+
+	sc = device_get_softc(dev);
+	DPRINTF(sc->dev, "gate_clkdev_write_4: addr %x val %x\n",
+	    addr, val);
+	return (SYSCON_UNLOCKED_WRITE_4(sc->syscon, addr, val));
+}
+
+static int
+ti_gate_clkdev_read_4(device_t dev, bus_addr_t addr, uint32_t *val)
+{
+	struct ti_gate_softc *sc;
+
+	sc = device_get_softc(dev);
+
+	*val = SYSCON_UNLOCKED_READ_4(sc->syscon, addr);
+	DPRINTF(sc->dev, "gate_clkdev_write_4: addr %x val %x\n",
+	     addr, *val);
+	return (0);
+}
+
+static int
+ti_gate_clkdev_modify_4(device_t dev, bus_addr_t addr,
+    uint32_t clear_mask, uint32_t set_mask)
+{
+	struct ti_gate_softc *sc;
+
+	sc = device_get_softc(dev);
+	DPRINTF(sc->dev, "clkdev_modify_4: addr %x clear_mask %x set_mask %x\n",
+	     addr, clear_mask, set_mask);
+	return (SYSCON_UNLOCKED_MODIFY_4(sc->syscon, addr, clear_mask,
+	    set_mask));
+}
+
+static void
+ti_gate_clkdev_device_lock(device_t dev)
+{
+	struct ti_gate_softc *sc;
+
+	sc = device_get_softc(dev);
+	DPRINTF(sc->dev, "ti_gate_clkdev_device_lock\n");
+	SYSCON_DEVICE_LOCK(sc->syscon->pdev);
+}
+
+static void
+ti_gate_clkdev_device_unlock(device_t dev)
+{
+	struct ti_gate_softc *sc;
+
+	sc = device_get_softc(dev);
+	DPRINTF(sc->dev, "ti_gate_clkdev_device_unlock\n");
+	SYSCON_DEVICE_UNLOCK(sc->syscon->pdev);
+}
 
 static int
 ti_gate_probe(device_t dev)
@@ -100,108 +157,113 @@ ti_gate_probe(device_t dev)
 		return (ENXIO);
 
 	device_set_desc(dev, "TI Gate Clock");
+	if (bootverbose == 0)
+		device_quiet(dev);
 
 	return (BUS_PROBE_DEFAULT);
-}
-
-static int
-register_clk(struct ti_gate_softc *sc) {
-	int err;
-	sc->clkdom = clkdom_create(sc->sc_dev);
-	if (sc->clkdom == NULL) {
-		DPRINTF(sc->sc_dev, "Failed to create clkdom\n");
-		return ENXIO;
-	}
-
-	err = clknode_gate_register(sc->clkdom, &sc->gate_def);
-	if (err) {
-		DPRINTF(sc->sc_dev, "clknode_gate_register failed %x\n", err);
-		return ENXIO;
-	}
-
-	err = clkdom_finit(sc->clkdom);
-	if (err) {
-		DPRINTF(sc->sc_dev, "Clk domain finit fails %x.\n", err);
-		return ENXIO;
-	}
-
-	return (0);
 }
 
 static int
 ti_gate_attach(device_t dev)
 {
 	struct ti_gate_softc *sc;
-	phandle_t node;
-	int err;
-	cell_t value;
+	phandle_t	node;
+	int		err, index;
+	cell_t 		value;
+	const char	*node_name;
 
 	sc = device_get_softc(dev);
-	sc->sc_dev = dev;
+	sc->dev = dev;
 	node = ofw_bus_get_node(dev);
+
+	/* Get syscon */
+	err = SYSCON_GET_HANDLE(dev, &sc->syscon);
+	if (err != 0) {
+		panic("Cannot get syscon handle.\n");
+	}
+
+	clk_parse_ofw_clk_name(dev, node, &node_name);
+	if (node_name == NULL) {
+		panic("Cannot get name of the clock node");
+	}
 
 	/* Get the compatible type */
 	sc->sc_type = ofw_bus_search_compatible(dev, compat_data)->ocd_data;
 
 	/* Get the content of reg properties */
-	if (sc->sc_type != TI_CLKDM_GATE_CLOCK) {
+	if (OF_hasprop(node, "reg") == 1) {
 		OF_getencprop(node, "reg", &value, sizeof(value));
 		sc->gate_def.offset = value;
+	} else {
+		/* assume parent is clksel... */
+		sc->gate_def.offset = ti_clksel_get_reg(device_get_parent(dev));
 	}
-#if DEBUG_GATE
-	else {
-		DPRINTF(sc->sc_dev, "no reg (TI_CLKDM_GATE_CLOCK)\n");
-	}
-#endif
 
 	if (OF_hasprop(node, "ti,bit-shift")) {
 		OF_getencprop(node, "ti,bit-shift", &value, sizeof(value));
 		sc->gate_def.shift = value;
-		DPRINTF(sc->sc_dev, "ti,bit-shift => shift %x\n", sc->gate_def.shift);
+		DPRINTF(sc->dev, "ti,bit-shift => shift %x\n",
+		    sc->gate_def.shift);
 	}
 	if (OF_hasprop(node, "ti,set-bit-to-disable")) {
 		sc->gate_def.on_value = 0;
 		sc->gate_def.off_value = 1;
-		DPRINTF(sc->sc_dev,
-			"on_value = 0, off_value = 1 (ti,set-bit-to-disable)\n");
+		DPRINTF(sc->dev,
+			"ti,set-bit-to-disable (on = 0, off = 1)\n");
 	} else {
 		sc->gate_def.on_value = 1;
 		sc->gate_def.off_value = 0;
-		DPRINTF(sc->sc_dev, "on_value = 1, off_value = 0\n");
+		DPRINTF(sc->dev,
+			"!ti,set-bit-to-disable (on = 1, off = 0)\n");
 	}
 
 	sc->gate_def.gate_flags = 0x0;
 
-	read_clock_cells(sc->sc_dev, &sc->clock_cell);
 
-	create_clkdef(sc->sc_dev, &sc->clock_cell, &sc->gate_def.clkdef);
+	/* Find parent in lookup table */
+	for (index = 0; index < nitems(gate_parent_table); index++) {
+		if (strcmp(node_name, gate_parent_table[index].node_name) == 0)
+			break;
+	}
+
+	if (index == nitems(gate_parent_table))
+		panic("Cant find clock %s\n", node_name);
+
+	DPRINTF(dev, "%s at gate_parent_table[%d]\n",
+		node_name, index);
+
+	/* Fill clknode_init_def */
+	sc->gate_def.clkdef.id = 1;
+	sc->gate_def.clkdef.flags = CLK_NODE_STATIC_STRINGS;
+	sc->gate_def.clkdef.name = gate_parent_table[index].node_name;
+	sc->gate_def.clkdef.parent_cnt = gate_parent_table[index].parent_cnt;
+	sc->gate_def.clkdef.parent_names =gate_parent_table[index].parent_names;
 
 	/* Calculate mask */
-	sc->gate_def.mask = (1 << fls(sc->clock_cell.num_real_clocks)) - 1;
-	DPRINTF(sc->sc_dev, "num_real_clocks %x gate_def.mask %x\n",
-		sc->clock_cell.num_real_clocks, sc->gate_def.mask);
+	sc->gate_def.mask = (1 << fls(sc->gate_def.clkdef.parent_cnt)) - 1;
+	DPRINTF(sc->dev, "num_real_clocks %x gate_def.mask %x\n",
+		sc->gate_def.clkdef.parent_cnt,
+		sc->gate_def.mask);
 
-	err = find_parent_clock_names(sc->sc_dev, &sc->clock_cell, &sc->gate_def.clkdef);
-
-	if (err) {
-		/* free_clkdef will be called in ti_gate_new_pass */
-		DPRINTF(sc->sc_dev, "find_parent_clock_names failed\n");
-		return (bus_generic_attach(sc->sc_dev));
+	sc->clkdom = clkdom_create(sc->dev);
+	if (sc->clkdom == NULL) {
+		DPRINTF(sc->dev, "Failed to create clkdom\n");
+		return ENXIO;
 	}
 
-	err = register_clk(sc);
-
-	if (err) {
-		/* free_clkdef will be called in ti_gate_new_pass */
-		DPRINTF(sc->sc_dev, "register_clk failed\n");
-		return (bus_generic_attach(sc->sc_dev));
+	err = clknode_gate_register(sc->clkdom, &sc->gate_def);
+	if (err != 0) {
+		DPRINTF(sc->dev, "clknode_gate_register failed %x\n", err);
+		return ENXIO;
 	}
 
-	sc->attach_done = true;
+	err = clkdom_finit(sc->clkdom);
+	if (err != 0) {
+		DPRINTF(sc->dev, "Clk domain finit fails %x.\n", err);
+		return ENXIO;
+	}
 
-	free_clkdef(&sc->gate_def.clkdef);
-
-	return (bus_generic_attach(sc->sc_dev));
+	return (bus_generic_attach(sc->dev));
 }
 
 static int
@@ -210,44 +272,18 @@ ti_gate_detach(device_t dev)
 	return (EBUSY);
 }
 
-static void
-ti_gate_new_pass(device_t dev) {
-	struct ti_gate_softc *sc;
-	int err;
-
-	sc = device_get_softc(dev);
-
-	if (sc->attach_done) {
-		return;
-	}
-
-	err = find_parent_clock_names(sc->sc_dev, &sc->clock_cell, &sc->gate_def.clkdef);
-	if (err) {
-		/* free_clkdef will be called in later call to ti_gate_new_pass */
-		DPRINTF(sc->sc_dev, "new_pass find_parent_clock_names failed\n");
-		return;
-	}
-
-	err = register_clk(sc);
-	if (err) {
-		/* free_clkdef will be called in later call to ti_gate_new_pass */
-		DPRINTF(sc->sc_dev, "new_pass register_clk failed\n");
-		return;
-	}
-
-	sc->attach_done = true;
-
-	free_clkdef(&sc->gate_def.clkdef);
-}
-
 static device_method_t ti_gate_methods[] = {
 	/* Device interface */
 	DEVMETHOD(device_probe,		ti_gate_probe),
 	DEVMETHOD(device_attach,	ti_gate_attach),
 	DEVMETHOD(device_detach,	ti_gate_detach),
 
-	/* Bus interface */
-	DEVMETHOD(bus_new_pass,		ti_gate_new_pass),
+	/* Clock device interface */
+	DEVMETHOD(clkdev_device_lock,	ti_gate_clkdev_device_lock),
+	DEVMETHOD(clkdev_device_unlock,	ti_gate_clkdev_device_unlock),
+	DEVMETHOD(clkdev_read_4,	ti_gate_clkdev_read_4),
+	DEVMETHOD(clkdev_write_4,	ti_gate_clkdev_write_4),
+	DEVMETHOD(clkdev_modify_4,	ti_gate_clkdev_modify_4),
 
 	DEVMETHOD_END
 };
