@@ -40,10 +40,16 @@
 #include <dev/fdt/simplebus.h>
 
 #include <dev/extres/clk/clk_mux.h>
+#include <dev/extres/syscon/syscon.h>
+
 #include <dev/ofw/ofw_bus.h>
 #include <dev/ofw/ofw_bus_subr.h>
 
-#include "clock_common.h"
+#include <arm/ti/clk/am33xx.h>
+#include <arm/ti/clk/ti_clock_common.h>
+#include <arm/ti/clk/ti_clksel.h>
+#include "clkdev_if.h"
+#include "syscon_if.h"
 
 #if 0
 #define DPRINTF(dev, msg...) device_printf(dev, msg)
@@ -51,18 +57,12 @@
 #define DPRINTF(dev, msg...)
 #endif
 
-/*
- * Devicetree description
- * Documentation/devicetree/bindings/clock/ti/mux.txt
- */
-
 struct ti_mux_softc {
-	device_t		sc_dev;
-	bool			attach_done;
+	device_t		dev;
 
 	struct clk_mux_def	mux_def;
-	struct clock_cell_info	clock_cell;
 	struct clkdom 		*clkdom;
+	struct syscon		*syscon;
 };
 
 static int ti_mux_probe(device_t dev);
@@ -80,6 +80,65 @@ static struct ofw_compat_data compat_data[] = {
 };
 
 static int
+ti_mux_clkdev_write_4(device_t dev, bus_addr_t addr, uint32_t val)
+{
+	struct ti_mux_softc *sc;
+
+	sc = device_get_softc(dev);
+	DPRINTF(sc->dev, "mux_clkdev_write_4: addr %x val %x\n",
+	     addr, val);
+	return (SYSCON_UNLOCKED_WRITE_4(sc->syscon, addr, val));
+}
+
+static int
+ti_mux_clkdev_read_4(device_t dev, bus_addr_t addr, uint32_t *val)
+{
+	struct ti_mux_softc *sc;
+	uint32_t rdval;
+
+	sc = device_get_softc(dev);
+
+	rdval = SYSCON_UNLOCKED_READ_4(sc->syscon, addr);
+	*val = rdval;
+	DPRINTF(sc->dev, "clkdev_read_4: addr %x val %x\n",
+	    addr, *val);
+	return (0);
+}
+
+static int
+ti_mux_clkdev_modify_4(device_t dev, bus_addr_t addr,
+    uint32_t clear_mask, uint32_t set_mask)
+{
+	struct ti_mux_softc *sc;
+
+	sc = device_get_softc(dev);
+	DPRINTF(sc->dev, "clkdev_modify_4: addr %x clear %x mask %x\n",
+	    addr, clear_mask, set_mask);
+	return (SYSCON_UNLOCKED_MODIFY_4(sc->syscon, addr, clear_mask,
+	    set_mask));
+}
+
+static void
+ti_mux_clkdev_device_lock(device_t dev)
+{
+	struct ti_mux_softc *sc;
+
+	sc = device_get_softc(dev);
+	DPRINTF(sc->dev, "ti_mux_clkdev_device_lock\n");
+	SYSCON_DEVICE_LOCK(sc->syscon->pdev);
+}
+
+static void
+ti_mux_clkdev_device_unlock(device_t dev)
+{
+	struct ti_mux_softc *sc;
+
+	sc = device_get_softc(dev);
+	DPRINTF(sc->dev, "ti_mux_clkdev_device_unlock\n");
+	SYSCON_DEVICE_UNLOCK(sc->syscon->pdev);
+}
+
+static int
 ti_mux_probe(device_t dev)
 {
 	if (!ofw_bus_status_okay(dev))
@@ -89,132 +148,111 @@ ti_mux_probe(device_t dev)
 		return (ENXIO);
 
 	device_set_desc(dev, "TI Mux Clock");
+	if (bootverbose == 0)
+		device_quiet(dev);
 
 	return (BUS_PROBE_DEFAULT);
-}
-
-static int
-register_clk(struct ti_mux_softc *sc) {
-	int err;
-
-	sc->clkdom = clkdom_create(sc->sc_dev);
-	if (sc->clkdom == NULL) {
-		DPRINTF(sc->sc_dev, "Failed to create clkdom\n");
-		return ENXIO;
-	}
-
-	err = clknode_mux_register(sc->clkdom, &sc->mux_def);
-	if (err) {
-		DPRINTF(sc->sc_dev, "clknode_mux_register failed %x\n", err);
-		return ENXIO;
-	}
-
-	err = clkdom_finit(sc->clkdom);
-	if (err) {
-		DPRINTF(sc->sc_dev, "Clk domain finit fails %x.\n", err);
-		return ENXIO;
-	}
-
-	return 0;
 }
 
 static int
 ti_mux_attach(device_t dev)
 {
 	struct ti_mux_softc *sc;
-	phandle_t node;
-	int err;
-	cell_t value;
+	phandle_t	node;
+	int		err, index;
+	cell_t		value;
+	const char 	*node_name;
 
 	sc = device_get_softc(dev);
-	sc->sc_dev = dev;
+	sc->dev = dev;
 	node = ofw_bus_get_node(dev);
 
+	err = SYSCON_GET_HANDLE(device_get_parent(dev), &sc->syscon);
+	if (err != 0) {
+		panic("Cannot get syscon handle.\n");
+	}
+
+	clk_parse_ofw_clk_name(dev, node, &node_name);
+	if (node_name == NULL) {
+		panic("Cannot get name of the clock node");
+	}
+
 	/* Grab the content of reg properties */
-	OF_getencprop(node, "reg", &value, sizeof(value));
-	sc->mux_def.offset = value;
+	if (OF_hasprop(node, "reg") == 1) {
+		OF_getencprop(node, "reg", &value, sizeof(value));
+		sc->mux_def.offset = value;
+	} else {
+		/* assume parent is clksel... */
+		sc->mux_def.offset = ti_clksel_get_reg(device_get_parent(dev));
+	}
 
 	if (OF_hasprop(node, "ti,bit-shift")) {
 		OF_getencprop(node, "ti,bit-shift", &value, sizeof(value));
 		sc->mux_def.shift = value;
-		DPRINTF(sc->sc_dev, "ti,bit-shift => shift %x\n", sc->mux_def.shift);
+		DPRINTF(sc->dev, "ti,bit-shift => shift %x\n",
+		    sc->mux_def.shift);
 	}
 	if (OF_hasprop(node, "ti,index-starts-at-one")) {
 		/* FIXME: Add support in dev/extres/clk */
 		/*sc->mux_def.mux_flags =  ... */
-		device_printf(sc->sc_dev, "ti,index-starts-at-one - Not implemented\n");
+		DPRINTF(sc->dev,
+		    "ti,index-starts-at-one - Not implemented\n");
 	}
 
 	if (OF_hasprop(node, "ti,set-rate-parent"))
-		device_printf(sc->sc_dev, "ti,set-rate-parent - Not implemented\n");
+		DPRINTF(sc->dev,
+		    "ti,set-rate-parent - Not implemented\n");
 	if (OF_hasprop(node, "ti,latch-bit"))
-		device_printf(sc->sc_dev, "ti,latch-bit - Not implemented\n");
+		DPRINTF(sc->dev,
+		    "ti,latch-bit - Not implemented\n");
 
-	read_clock_cells(sc->sc_dev, &sc->clock_cell);
 
-	create_clkdef(sc->sc_dev, &sc->clock_cell, &sc->mux_def.clkdef);
+	/* Find parent in lookup table */
+	for (index = 0; index < nitems(mux_parent_table); index++) {
+		if (strcmp(node_name, mux_parent_table[index].node_name) == 0)
+			break;
+	}
+	if (index == nitems(mux_parent_table))
+		panic("Cant find clock %s\n", node_name);
+
+	DPRINTF(sc->dev, "%s at mux_parent_table[%d]\n",
+			node_name, index);
+	/* Fill clknode_init_def */
+	sc->mux_def.clkdef.id = 1;
+	sc->mux_def.clkdef.flags = CLK_NODE_STATIC_STRINGS;
+
+	sc->mux_def.clkdef.name = mux_parent_table[index].node_name;
+	sc->mux_def.clkdef.parent_cnt = mux_parent_table[index].parent_cnt;
+	sc->mux_def.clkdef.parent_names = mux_parent_table[index].parent_names;
 
 	/* Figure out the width from ti_max_div */
 	if (sc->mux_def.mux_flags)
-		sc->mux_def.width = fls(sc->clock_cell.num_real_clocks-1);
+		sc->mux_def.width = fls(sc->mux_def.clkdef.parent_cnt-1);
 	else
-		sc->mux_def.width = fls(sc->clock_cell.num_real_clocks);
+		sc->mux_def.width = fls(sc->mux_def.clkdef.parent_cnt);
 
-	DPRINTF(sc->sc_dev, "sc->clock_cell.num_real_clocks %x def.width %x\n",
-		sc->clock_cell.num_real_clocks, sc->mux_def.width);
+	DPRINTF(sc->dev, "parents %x def.width %x\n",
+		sc->mux_def.clkdef.parent_cnt, sc->mux_def.width);
 
-	err = find_parent_clock_names(sc->sc_dev, &sc->clock_cell, &sc->mux_def.clkdef);
-
-	if (err) {
-		/* free_clkdef will be called in ti_mux_new_pass */
-		DPRINTF(sc->sc_dev, "find_parent_clock_names failed\n");
-		return (bus_generic_attach(sc->sc_dev));
+	sc->clkdom = clkdom_create(sc->dev);
+	if (sc->clkdom == NULL) {
+		DPRINTF(sc->dev, "Failed to create clkdom\n");
+		return ENXIO;
 	}
 
-	err = register_clk(sc);
-
-	if (err) {
-		/* free_clkdef will be called in ti_mux_new_pass */
-		DPRINTF(sc->sc_dev, "register_clk failed\n");
-		return (bus_generic_attach(sc->sc_dev));
+	err = clknode_mux_register(sc->clkdom, &sc->mux_def);
+	if (err != 0) {
+		DPRINTF(sc->dev, "clknode_mux_register failed %x\n", err);
+		return ENXIO;
 	}
 
-	sc->attach_done = true;
-
-	free_clkdef(&sc->mux_def.clkdef);
-
-	return (bus_generic_attach(sc->sc_dev));
-}
-
-static void
-ti_mux_new_pass(device_t dev)
-{
-	struct ti_mux_softc *sc;
-	int err;
-
-	sc = device_get_softc(dev);
-
-	if (sc->attach_done) {
-		return;
+	err = clkdom_finit(sc->clkdom);
+	if (err != 0) {
+		DPRINTF(sc->dev, "Clk domain finit fails %x.\n", err);
+		return ENXIO;
 	}
 
-	err = find_parent_clock_names(sc->sc_dev, &sc->clock_cell, &sc->mux_def.clkdef);
-	if (err) {
-		/* free_clkdef will be called in later call to ti_mux_new_pass */
-		DPRINTF(sc->sc_dev, "ti_mux_new_pass find_parent_clock_names failed\n");
-		return;
-	}
-
-	err = register_clk(sc);
-	if (err) {
-		/* free_clkdef will be called in later call to ti_mux_new_pass */
-		DPRINTF(sc->sc_dev, "ti_mux_new_pass register_clk failed\n");
-		return;
-	}
-
-	sc->attach_done = true;
-
-	free_clkdef(&sc->mux_def.clkdef);
+	return (bus_generic_attach(sc->dev));
 }
 
 static int
@@ -229,8 +267,12 @@ static device_method_t ti_mux_methods[] = {
 	DEVMETHOD(device_attach,	ti_mux_attach),
 	DEVMETHOD(device_detach,	ti_mux_detach),
 
-	/* Bus interface */
-	DEVMETHOD(bus_new_pass,		ti_mux_new_pass),
+	/* Clock device interface */
+	DEVMETHOD(clkdev_device_lock,	ti_mux_clkdev_device_lock),
+	DEVMETHOD(clkdev_device_unlock,	ti_mux_clkdev_device_unlock),
+	DEVMETHOD(clkdev_read_4,	ti_mux_clkdev_read_4),
+	DEVMETHOD(clkdev_write_4,	ti_mux_clkdev_write_4),
+	DEVMETHOD(clkdev_modify_4,	ti_mux_clkdev_modify_4),
 
 	DEVMETHOD_END
 };

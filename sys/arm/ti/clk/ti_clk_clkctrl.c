@@ -34,6 +34,7 @@
 #include <dev/extres/clk/clk.h>
 
 #include <arm/ti/clk/ti_clk_clkctrl.h>
+#include <arm/ti/clk/ti_clock_common.h>
 
 #include "clkdev_if.h"
 
@@ -47,25 +48,23 @@
  * clknode for clkctrl, implements gate and mux (for gpioc)
  */
 
-#define GPIO_X_GDBCLK_MASK	0x00040000
 #define IDLEST_MASK		0x00030000
 #define MODULEMODE_MASK		0x00000003
 
-#define GPIOX_GDBCLK_ENABLE	0x00040000
-#define GPIOX_GDBCLK_DISABLE	0x00000000
 #define IDLEST_FUNC		0x00000000
 #define IDLEST_TRANS		0x00010000
 #define IDLEST_IDLE		0x00020000
 #define IDLEST_DISABLE		0x00030000
 
 #define MODULEMODE_DISABLE	0x0
-#define MODULEMODE_ENABLE	0x2
+#define MODULEMODE_ENABLE_HW	0x1
+#define MODULEMODE_ENABLE_SW	0x2
 
 struct ti_clkctrl_clknode_sc {
 	device_t	dev;
-	bool		gdbclk;
 	/* omap4-cm range.host + ti,clkctrl reg[0] */
 	uint32_t	register_offset;
+	uint8_t		flags;
 };
 
 #define	WRITE4(_clk, off, val)						\
@@ -90,89 +89,47 @@ ti_clkctrl_init(struct clknode *clk, device_t dev)
 }
 
 static int
-ti_clkctrl_set_gdbclk_gate(struct clknode *clk, bool enable)
-{
-	struct ti_clkctrl_clknode_sc *sc;
-	uint32_t val, gpio_x_gdbclk;
-	uint32_t timeout = 100;
-
-	sc = clknode_get_softc(clk);
-
-	READ4(clk, sc->register_offset, &val);
-	DPRINTF(sc->dev, "val(%x) & (%x | %x = %x)\n",
-	    val, GPIO_X_GDBCLK_MASK, MODULEMODE_MASK,
-	    GPIO_X_GDBCLK_MASK | MODULEMODE_MASK);
-
-	if (enable) {
-		val = val & MODULEMODE_MASK;
-		val |= GPIOX_GDBCLK_ENABLE;
-	} else {
-		val = val & MODULEMODE_MASK;
-		val |= GPIOX_GDBCLK_DISABLE;
-	}
-
-	DPRINTF(sc->dev, "val %x\n", val);
-	WRITE4(clk, sc->register_offset, val);
-
-	/* Wait */
-	while (timeout) {
-		READ4(clk, sc->register_offset, &val);
-		gpio_x_gdbclk = val & GPIO_X_GDBCLK_MASK;
-		if (enable && (gpio_x_gdbclk == GPIOX_GDBCLK_ENABLE))
-			break;
-		else if (!enable && (gpio_x_gdbclk == GPIOX_GDBCLK_DISABLE))
-			break;
-		DELAY(10);
-		timeout--;
-	}
-	if (timeout == 0) {
-		device_printf(sc->dev, "ti_clkctrl_set_gdbclk_gate: Timeout\n");
-		return (1);
-	}
-
-	return (0);
-}
-
-static int
 ti_clkctrl_set_gate(struct clknode *clk, bool enable)
 {
 	struct ti_clkctrl_clknode_sc *sc;
-	uint32_t	val, idlest, module;
+	uint32_t	val, idlest, modulemode_reg, modulemode_val=0;
 	uint32_t timeout=100;
-	int err;
 
 	sc = clknode_get_softc(clk);
 
-	if (sc->gdbclk) {
-		err = ti_clkctrl_set_gdbclk_gate(clk, enable);
-		return (err);
-	}
-
+	DEVICE_LOCK(clk);
 	READ4(clk, sc->register_offset, &val);
 
-	if (enable)
-		WRITE4(clk, sc->register_offset, MODULEMODE_ENABLE);
-	else
+	if (enable == false)
 		WRITE4(clk, sc->register_offset, MODULEMODE_DISABLE);
+	/* enable == true for following two */
+	else if ((sc->flags & TI_CLKCTRL_FLAGS_MM_HW) == TI_CLKCTRL_FLAGS_MM_HW) {
+		modulemode_val = MODULEMODE_ENABLE_HW;
+		WRITE4(clk, sc->register_offset, MODULEMODE_ENABLE_HW);
+	} else {
+		modulemode_val = MODULEMODE_ENABLE_SW;
+		WRITE4(clk, sc->register_offset, MODULEMODE_ENABLE_SW);
+	}
 
 	while (timeout) {
 		READ4(clk, sc->register_offset, &val);
 		idlest = val & IDLEST_MASK;
-		module = val & MODULEMODE_MASK;
-		if (enable &&
-		    (idlest == IDLEST_FUNC || idlest == IDLEST_TRANS) &&
-		    module == MODULEMODE_ENABLE)
+		modulemode_reg = val & MODULEMODE_MASK;
+		if (enable == true &&
+		    (idlest == IDLEST_FUNC || idlest == IDLEST_IDLE) &&
+		    modulemode_reg == modulemode_val)
 			break;
-		else if (!enable &&
+		else if (enable == false &&
 		    idlest == IDLEST_DISABLE &&
-		    module == MODULEMODE_DISABLE)
+		    modulemode_reg == MODULEMODE_DISABLE)
 			break;
 		DELAY(10);
 		timeout--;
 	}
 
+	DEVICE_UNLOCK(clk);
 	if (timeout == 0) {
-		device_printf(sc->dev, "ti_clkctrl_set_gate: Timeout\n");
+		DPRINTF(sc->dev, "ti_clkctrl_set_gate: Timeout\n");
 		return (1);
 	}
 
@@ -201,14 +158,16 @@ ti_clknode_clkctrl_register(struct clkdom *clkdom,
 	    &clkdef->clkdef);
 
 	if (clk == NULL) {
+		DPRINTF(sc->dev, "clknode_create failed.\n");
 		return (1);
 	}
 
 	sc = clknode_get_softc(clk);
 	sc->register_offset = clkdef->register_offset;
-	sc->gdbclk = clkdef->gdbclk;
+	sc->flags = clkdef->flags;
 
 	if (clknode_register(clkdom, clk) == NULL) {
+		DPRINTF(sc->dev, "clknode_register failed.\n");
 		return (2);
 	}
 	return (0);

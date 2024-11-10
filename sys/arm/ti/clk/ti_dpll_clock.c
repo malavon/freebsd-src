@@ -41,8 +41,9 @@
 #include <dev/ofw/ofw_bus.h>
 #include <dev/ofw/ofw_bus_subr.h>
 
+#include <arm/ti/clk/am33xx.h>
 #include <arm/ti/clk/ti_clk_dpll.h>
-#include "clock_common.h"
+#include <arm/ti/clk/ti_clock_common.h>
 
 #if 0
 #define DPRINTF(dev, msg...) device_printf(dev, msg)
@@ -50,19 +51,12 @@
 #define DPRINTF(dev, msg...)
 #endif
 
-/*
- * Devicetree description
- * Documentation/devicetree/bindings/clock/ti/dpll.txt
- */
-
 struct ti_dpll_softc {
 	device_t		dev;
 	uint8_t			dpll_type;
 
-	bool			attach_done;
 	struct ti_clk_dpll_def	dpll_def;
 
-	struct clock_cell_info	clock_cell;
 	struct clkdom		*clkdom;
 };
 
@@ -111,32 +105,6 @@ static struct ofw_compat_data compat_data[] = {
 };
 
 static int
-register_clk(struct ti_dpll_softc *sc) {
-	int err;
-
-	sc->clkdom = clkdom_create(sc->dev);
-	if (sc->clkdom == NULL) {
-		DPRINTF(sc->dev, "Failed to create clkdom\n");
-		return (ENXIO);
-	}
-
-	err = ti_clknode_dpll_register(sc->clkdom, &sc->dpll_def);
-	if (err) {
-		DPRINTF(sc->dev,
-			"ti_clknode_dpll_register failed %x\n", err);
-		return (ENXIO);
-	}
-
-	err = clkdom_finit(sc->clkdom);
-	if (err) {
-		DPRINTF(sc->dev, "Clk domain finit fails %x.\n", err);
-		return (ENXIO);
-	}
-
-	return (0);
-}
-
-static int
 ti_dpll_probe(device_t dev)
 {
 	if (!ofw_bus_status_okay(dev))
@@ -146,6 +114,8 @@ ti_dpll_probe(device_t dev)
 		return (ENXIO);
 
 	device_set_desc(dev, "TI DPLL Clock");
+	if (bootverbose == 0)
+		device_quiet(dev);
 
 	return (BUS_PROBE_DEFAULT);
 }
@@ -155,7 +125,7 @@ parse_dpll_reg(struct ti_dpll_softc *sc) {
 	ssize_t numbytes_regs;
 	uint32_t num_regs;
 	phandle_t node;
-	cell_t reg_cells[4];
+	cell_t reg_cells[6];
 
 	if (sc->dpll_type == TI_AM3_DPLL_X2_CLOCK ||
 		sc->dpll_type == TI_OMAP4_DPLL_X2_CLOCK) {
@@ -173,7 +143,7 @@ parse_dpll_reg(struct ti_dpll_softc *sc) {
 	num_regs = numbytes_regs / sizeof(cell_t);
 
 	/* Sanity check */
-	if (num_regs > 4)
+	if (num_regs > 6)
 		return (ENXIO);
 
 	OF_getencprop(node, "reg", reg_cells, numbytes_regs);
@@ -185,11 +155,12 @@ parse_dpll_reg(struct ti_dpll_softc *sc) {
 		case TI_AM3_DPLL_CLOCK:
 		case TI_AM3_DPLL_CORE_CLOCK:
 		case TI_AM3_DPLL_X2_CLOCK:
-			if (num_regs != 3)
-				return (ENXIO);
 			sc->dpll_def.ti_clkmode_offset = reg_cells[0];
 			sc->dpll_def.ti_idlest_offset = reg_cells[1];
 			sc->dpll_def.ti_clksel_offset = reg_cells[2];
+			/* Do not have autoidle */
+			sc->dpll_def.ti_ssc_deltam_offset = reg_cells[3];
+			sc->dpll_def.ti_ssc_modfreq_offset = reg_cells[4];
 			break;
 
 		case TI_OMAP2_DPLL_CORE_CLOCK:
@@ -204,6 +175,8 @@ parse_dpll_reg(struct ti_dpll_softc *sc) {
 			sc->dpll_def.ti_idlest_offset = reg_cells[1];
 			sc->dpll_def.ti_clksel_offset = reg_cells[2];
 			sc->dpll_def.ti_autoidle_offset = reg_cells[3];
+			sc->dpll_def.ti_ssc_deltam_offset = reg_cells[4];
+			sc->dpll_def.ti_ssc_modfreq_offset = reg_cells[5];
 			break;
 	}
 
@@ -257,15 +230,21 @@ parse_dpll_reg(struct ti_dpll_softc *sc) {
 static int
 ti_dpll_attach(device_t dev)
 {
-	struct ti_dpll_softc *sc;
-	phandle_t node;
-	int err;
+	struct ti_dpll_softc	*sc;
+	phandle_t		node;
+	int			err, index;
+	const char 		*node_name;
 
 	sc = device_get_softc(dev);
 	sc->dev = dev;
 
 	sc->dpll_type = ofw_bus_search_compatible(dev, compat_data)->ocd_data;
 	node = ofw_bus_get_node(dev);
+
+	clk_parse_ofw_clk_name(dev, node, &node_name);
+	if (node_name == NULL) {
+		panic("Cannot get name of the clock node");
+	}
 
 	/* Grab the content of reg properties */
 	parse_dpll_reg(sc);
@@ -282,31 +261,52 @@ ti_dpll_attach(device_t dev)
 	if (OF_hasprop(node, "ti,lock")) {
 		sc->dpll_def.ti_clkmode_flags |= LOCK_MODE_FLAG;
 	}
-
-	read_clock_cells(sc->dev, &sc->clock_cell);
-
-	create_clkdef(sc->dev, &sc->clock_cell, &sc->dpll_def.clkdef);
-
-	err = find_parent_clock_names(sc->dev, &sc->clock_cell,
-			&sc->dpll_def.clkdef);
-
-	if (err) {
-		/* free_clkdef will be called in ti_dpll_new_pass */
-		DPRINTF(sc->dev, "find_parent_clock_names failed\n");
-		return (bus_generic_attach(sc->dev));
+	if (OF_hasprop(node, "ti,min-div")) {
+	}
+	if (OF_hasprop(node, "ti,ssc-deltam")) {
+	}
+	if (OF_hasprop(node, "ti,ssc-modfreq-hz")) {
+	}
+	if (OF_hasprop(node, "ti,ssc-downspread")) {
 	}
 
-	err = register_clk(sc);
-
-	if (err) {
-		/* free_clkdef will be called in ti_dpll_new_pass */
-		DPRINTF(sc->dev, "register_clk failed\n");
-		return (bus_generic_attach(sc->dev));
+	/* Find parent in lookup table */
+	for (index = 0; index < nitems(dpll_parent_table); index++) {
+		if (strcmp(node_name, dpll_parent_table[index].node_name) == 0)
+			break;
 	}
 
-	sc->attach_done = true;
+	if (index == nitems(dpll_parent_table))
+		panic("Cant find clock %s\n", node_name);
 
-	free_clkdef(&sc->dpll_def.clkdef);
+	DPRINTF(sc->dev, "%s at dpll_parent_table[%d]\n", node_name, index);
+
+	/* Fill clknode_init_def */
+	sc->dpll_def.clkdef.id = 1;
+	sc->dpll_def.clkdef.name = dpll_parent_table[index].node_name;
+	sc->dpll_def.clkdef.parent_cnt = dpll_parent_table[index].parent_cnt;
+	sc->dpll_def.clkdef.parent_names =
+		dpll_parent_table[index].parent_names;
+	sc->dpll_def.clkdef.flags = CLK_NODE_STATIC_STRINGS;
+
+	sc->clkdom = clkdom_create(sc->dev);
+	if (sc->clkdom == NULL) {
+		DPRINTF(sc->dev, "Failed to create clkdom\n");
+		return (ENXIO);
+	}
+
+	err = ti_clknode_dpll_register(sc->clkdom, &sc->dpll_def);
+	if (err != 0) {
+		DPRINTF(sc->dev,
+			"ti_clknode_dpll_register failed %x\n", err);
+		return (ENXIO);
+	}
+
+	err = clkdom_finit(sc->clkdom);
+	if (err != 0) {
+		DPRINTF(sc->dev, "Clk domain finit fails %x.\n", err);
+		return (ENXIO);
+	}
 
 	return (bus_generic_attach(sc->dev));
 }
@@ -317,46 +317,11 @@ ti_dpll_detach(device_t dev)
 	return (EBUSY);
 }
 
-static void
-ti_dpll_new_pass(device_t dev)
-{
-	struct ti_dpll_softc *sc;
-	int err;
-
-	sc = device_get_softc(dev);
-
-	if (sc->attach_done) {
-		return;
-	}
-
-	err = find_parent_clock_names(sc->dev, &sc->clock_cell,
-		&sc->dpll_def.clkdef);
-	if (err) {
-		/* free_clkdef will be called in a later call to ti_dpll_new_pass */
-		DPRINTF(sc->dev,
-			"new_pass find_parent_clock_names failed\n");
-		return;
-	}
-
-	err = register_clk(sc);
-	if (err) {
-		/* free_clkdef will be called in a later call to ti_dpll_new_pass */
-		DPRINTF(sc->dev, "new_pass register_clk failed\n");
-		return;
-	}
-
-	sc->attach_done = true;
-	free_clkdef(&sc->dpll_def.clkdef);
-}
-
 static device_method_t ti_dpll_methods[] = {
 	/* Device interface */
 	DEVMETHOD(device_probe,		ti_dpll_probe),
 	DEVMETHOD(device_attach,	ti_dpll_attach),
 	DEVMETHOD(device_detach,	ti_dpll_detach),
-
-	/* Bus interface */
-	DEVMETHOD(bus_new_pass,		ti_dpll_new_pass),
 
 	DEVMETHOD_END
 };

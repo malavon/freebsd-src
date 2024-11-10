@@ -87,6 +87,9 @@ struct ti_clk_dpll_def {
 	struct ti_clk_factor	ti_clksel_div;
 
 	uint32_t		ti_autoidle_offset;
+
+	uint32_t		ti_ssc_deltam_offset;
+	uint32_t		ti_ssc_modfreq_offset;
 };
 
 int ti_clknode_dpll_register(struct clkdom *clkdom, struct ti_clk_dpll_def *clkdef);

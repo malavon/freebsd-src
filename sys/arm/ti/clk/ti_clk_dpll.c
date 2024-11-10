@@ -58,6 +58,8 @@ struct ti_dpll_clknode_sc {
 	struct ti_clk_factor	p; /* ti_clksel_div */
 
 	uint32_t		ti_autoidle_offset;
+	uint32_t		ti_ssc_deltam_offset;
+	uint32_t		ti_ssc_modfreq_offset;
 };
 
 #define	WRITE4(_clk, off, val)						\
@@ -325,6 +327,8 @@ ti_clknode_dpll_register(struct clkdom *clkdom, struct ti_clk_dpll_def *clkdef)
 	sc->p.flags = clkdef->ti_clksel_div.flags;
 
 	sc->ti_autoidle_offset = clkdef->ti_autoidle_offset;
+	sc->ti_ssc_deltam_offset = clkdef->ti_ssc_deltam_offset;
+	sc->ti_ssc_modfreq_offset = clkdef->ti_ssc_modfreq_offset;
 
 	clknode_register(clkdom, clk);
 
