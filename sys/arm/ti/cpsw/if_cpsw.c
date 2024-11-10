@@ -94,6 +94,12 @@
 
 #include "miibus_if.h"
 
+static struct ofw_compat_data compat_data[] = {
+	{ "ti,cpsw-switch",	1 },
+	{ "ti,cpsw",		1 },
+	{ NULL,			0 },
+};
+
 /* Device probe/attach/detach. */
 static int cpsw_probe(device_t);
 static int cpsw_attach(device_t);
@@ -241,8 +247,6 @@ MODULE_DEPEND(cpsw, miibus, 1, 1, 1);
 #ifdef CPSW_ETHERSWITCH
 static struct cpsw_vlangroups cpsw_vgroups[CPSW_VLANS];
 #endif
-
-static uint32_t slave_mdio_addr[] = { 0x4a100200, 0x4a100300 };
 
 static struct resource_spec irq_res_spec[] = {
 	{ SYS_RES_IRQ, 0, RF_ACTIVE | RF_SHAREABLE },
@@ -686,7 +690,6 @@ cpsw_init(struct cpsw_softc *sc)
  * Device Probe, Attach, Detach.
  *
  */
-
 static int
 cpsw_probe(device_t dev)
 {
@@ -694,7 +697,7 @@ cpsw_probe(device_t dev)
 	if (!ofw_bus_status_okay(dev))
 		return (ENXIO);
 
-	if (!ofw_bus_is_compatible(dev, "ti,cpsw"))
+	if (ofw_bus_search_compatible(dev, compat_data)->ocd_data == 0)
 		return (ENXIO);
 
 	device_set_desc(dev, "3-port Switch Ethernet Subsystem");
@@ -736,26 +739,29 @@ cpsw_get_fdt_data(struct cpsw_softc *sc, int port)
 	char *name;
 	int len, phy, vlan;
 	pcell_t phy_id[3], vlan_id;
-	phandle_t child;
+	phandle_t child, etherchild;
 	unsigned long mdio_child_addr;
 
 	/* Find any slave with phy-handle/phy_id */
 	phy = -1;
 	vlan = -1;
-	for (child = OF_child(sc->node); child != 0; child = OF_peer(child)) {
+	etherchild = ofw_bus_find_child(sc->node, "ethernet-ports");
+	if (etherchild == 0)
+		return (ENXIO);
+
+	for (child = OF_child(etherchild); child != 0; child = OF_peer(child)) {
 		if (OF_getprop_alloc(child, "name", (void **)&name) < 0)
 			continue;
-		if (sscanf(name, "slave@%lx", &mdio_child_addr) != 1) {
+		if (sscanf(name, "port@%lx", &mdio_child_addr) != 1) {
 			OF_prop_free(name);
 			continue;
 		}
 		OF_prop_free(name);
 
-		if (mdio_child_addr != slave_mdio_addr[port] &&
-		    mdio_child_addr != (slave_mdio_addr[port] & 0xFFF))
+		if (mdio_child_addr - 1 != port)
 			continue;
 
-		if (fdt_get_phyaddr(child, NULL, &phy, NULL) != 0){
+		if (fdt_get_phyaddr(child, NULL, &phy, NULL) != 0) {
 			/* Users with old DTB will have phy_id instead */
 			phy = -1;
 			len = OF_getproplen(child, "phy_id");
