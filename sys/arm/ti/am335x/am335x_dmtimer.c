@@ -278,6 +278,9 @@ am335x_dmtimer_probe(device_t dev)
 
 	device_set_descf(dev, "AM335x DMTimer%d", tmr_num);
 
+	if (bootverbose == 0)
+		device_quiet(dev);
+
 	return(BUS_PROBE_DEFAULT);
 }
 
@@ -299,9 +302,9 @@ am335x_dmtimer_attach(device_t dev)
 		return (ENXIO);
 	}
 
-	err = clk_get_by_name(dev, "sys_clkin_ck@40", &sys_clkin);
+	err = clk_get_by_name(dev, "sys_clkin_ck", &sys_clkin);
 	if (err != 0) {
-		device_printf(dev, "Cant find sys_clkin_ck@40 err: %d\n", err);
+		device_printf(dev, "Cant find sys_clkin_ck err: %d\n", err);
 		return (ENXIO);
 	}
 
