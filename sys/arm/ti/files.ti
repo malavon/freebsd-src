@@ -26,6 +26,7 @@ arm/ti/clk/ti_dpll_clock.c			standard
 arm/ti/clk/ti_mux_clock.c			standard
 arm/ti/clk/ti_divider_clock.c			standard
 arm/ti/clk/ti_gate_clock.c			standard
+arm/ti/clk/ti_clksel.c				standard
 
 dev/uart/uart_dev_ti8250.c			optional	uart
 dev/uart/uart_dev_ns8250.c			optional	uart
