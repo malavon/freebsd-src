@@ -1,5 +1,6 @@
 
 arm/ti/ti_cpuid.c				standard
+# arm/ti/ti_cpufreq.c				standard
 arm/ti/ti_machdep.c				standard
 arm/ti/ti_prcm.c				standard
 arm/ti/ti_omap4_cm.c				standard
