@@ -283,7 +283,7 @@ extra_chroot_setup() {
 				make -C /usr/ports/devel/git FORCE_PKG_REGISTER=1 \
 				WRKDIRPREFIX=/tmp/ports \
 				DISTDIR=/tmp/distfiles \
-				install clean distclean
+				install clean #distclean
 		else
 			eval chroot ${CHROOTDIR} env ASSUME_ALWAYS_YES=yes \
 				pkg install -y devel/git
@@ -343,7 +343,7 @@ extra_chroot_setup() {
 		for _PORT in ${EMBEDDEDPORTS}; do
 			eval chroot ${CHROOTDIR} env ${PBUILD_FLAGS} make -C \
 				/usr/ports/${_PORT} \
-				FORCE_PKG_REGISTER=1 deinstall install clean distclean
+				FORCE_PKG_REGISTER=1 deinstall install clean #distclean
 		done
 	fi
 
