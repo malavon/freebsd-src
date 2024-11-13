@@ -405,7 +405,7 @@ cpufreq_dt_oppv2_parse(struct cpufreq_dt_softc *sc, phandle_t node)
 	if (!OF_hasprop(opp_table, "opp-shared")/* && CPU_COUNT(&sc->cpus) > 1*/) {
 		device_printf(sc->dev, "Only opp-shared is supported\n");
 		device_printf(sc->dev, "We have %d cpu on this dev\n", CPU_COUNT(&sc->cpus));
-		return (ENXIO);
+		// return (ENXIO);
 	}
 
 	for (opp = OF_child(opp_table); opp > 0; opp = OF_peer(opp))
