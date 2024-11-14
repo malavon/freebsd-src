@@ -514,6 +514,9 @@ cpufreq_dt_attach(device_t dev)
 	 * quite yet.  If it's operating-points-v2 then regulator
 	 * and voltage entries are optional.
 	 */
+	if (OF_hasprop(node, "cpu0-supply"))
+		device_printf(dev, "CPU has cpu0-supply property as expected ... \n");
+	
 	if (regulator_get_by_ofw_property(dev, node, "cpu-supply",
 	    &sc->reg) == 0)
 		device_printf(dev, "Found cpu-supply\n");
