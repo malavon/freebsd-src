@@ -47,7 +47,7 @@
 
 #include "cpufreq_if.h"
 
-#if 0
+#if 1
 #define DPRINTF(dev, msg...) device_printf(dev, "cpufreq_dt: " msg);
 #else
 #define DPRINTF(dev, msg...)
@@ -331,6 +331,7 @@ cpufreq_dt_probe(device_t dev)
 
 	node = ofw_bus_get_node(device_get_parent(dev));
 
+	device_printf(dev, "PROBING FOR CPUFREQ_DT\n");
 	/*
 	 * Note - supply isn't required here for probe; we'll check
 	 * it out in more detail during attach.
@@ -342,6 +343,20 @@ cpufreq_dt_probe(device_t dev)
 	  !OF_hasprop(node, "operating-points-v2"))
 		return (ENXIO);
 
+	if (!OF_hasprop(node, "device_type"))
+	{
+		device_printf(dev, "DEVICE has no device_type\n");
+		return (ENXIO);
+	}
+
+	char device_type[16];
+	OF_getprop(node, "device_type", device_type, sizeof(device_type));
+		
+	if (strcmp(device_type, "cpu") != 0)
+	{
+		device_printf(dev, "DEVICE IS NOT A CPU\n");
+		return (ENXIO);
+	}
 	device_set_desc(dev, "Generic cpufreq driver");
 	return (BUS_PROBE_GENERIC);
 }
@@ -402,9 +417,8 @@ cpufreq_dt_oppv2_parse(struct cpufreq_dt_softc *sc, phandle_t node)
 	if (opp_table == opp_xref)
 		return (ENXIO);
 
-	if (!OF_hasprop(opp_table, "opp-shared")/* && CPU_COUNT(&sc->cpus) > 1*/) {
+	if (!OF_hasprop(opp_table, "opp-shared")) {
 		device_printf(sc->dev, "Only opp-shared is supported\n");
-		device_printf(sc->dev, "We have %d cpu on this dev\n", CPU_COUNT(&sc->cpus));
 		// return (ENXIO);
 	}
 
@@ -506,6 +520,8 @@ cpufreq_dt_attach(device_t dev)
 	else if (regulator_get_by_ofw_property(dev, node, "cpu0-supply",
 	    &sc->reg) == 0)
 		device_printf(dev, "Found cpu0-supply\n");
+	else
+		device_printf(dev, "Found no regulator\n");
 
 	/*
 	 * Determine which operating mode we're in.  Error out if we expect
