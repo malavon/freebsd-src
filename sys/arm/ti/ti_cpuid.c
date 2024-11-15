@@ -208,6 +208,8 @@ am335x_get_revision(void)
 	bus_space_handle_t bsh;
 	int major;
 	int minor;
+	int package = 0;
+	const char* package_text;
 
 	bus_space_map(fdtbus_bs_tag, AM335X_CONTROL_BASE, AM335X_CONTROL_SIZE, 0, &bsh);
 	chip_revision = bus_space_read_4(fdtbus_bs_tag, bsh, AM335X_CONTROL_DEVICE_ID);
@@ -255,8 +257,15 @@ am335x_get_revision(void)
 			minor = AM335X_DEVREV(chip_revision);
 			break;
 	}
-	printf("Texas Instruments AM335%c Processor, Revision ES%u.%u\n",
-		cpu_last_char, major, minor);
+
+	// not that interesting, here for testing if reading the register works (it's required for cpufreq anyway)
+	if(major >= 2) {
+		package = (bus_space_read_4(fdtbus_bs_tag, bsh, AM335X_CONTROL_EFUSE_SMA) >> 16 ) & 0x3;
+	}
+	const char* packages[] = {"", " (ZCZ Package)", " (ZCE Package)", ""};
+	package_text = packages[package];
+	printf("Texas Instruments AM335%c Processor, Revision ES%u.%u%s\n",
+		cpu_last_char, major, minor, package_text);
 }
 
 /**
